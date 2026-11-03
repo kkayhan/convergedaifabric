@@ -1,0 +1,9 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: aif-prom          # fixed uid, referenced by the dashboard JSON
+    type: prometheus
+    url: http://prometheus.aifabric.svc:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 5s

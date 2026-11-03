@@ -1,0 +1,71 @@
+# aifabric telemetry: what EDA's Prometheus exporter (app prom.eda.nokia.com, endpoint
+# /core/httpproxy/v1/prometheus-exporter/metrics; NOT in a fresh EDA install => telemetry/apps.yaml)
+# publishes for the topology dashboard.
+# Own names (aifabric-*) and `where` = namespace aifabric only, so another demo's Exports
+# (microseg: interface, interface-traffic-rate) neither collide nor duplicate series.
+# Exports live in eda-system; deploy.sh grafana applies them, destroy.sh deletes them.
+apiVersion: prom.eda.nokia.com/v1alpha1
+kind: Export
+metadata:
+  name: aifabric-interface-state
+  namespace: eda-system
+spec:
+  exports:
+    - path: .namespace.node.srl.interface
+      where: '.namespace.name = "aifabric"'
+      fields: [oper-state]
+      mappings:
+        - { source: up, destination: "1" }
+        - { source: down, destination: "0" }
+      metricName: { regex: namespace_(.+), replacement: $1 }
+---
+apiVersion: prom.eda.nokia.com/v1alpha1
+kind: Export
+metadata:
+  name: aifabric-interface-rate
+  namespace: eda-system
+spec:
+  exports:
+    - path: .namespace.node.srl.interface.traffic-rate
+      where: '.namespace.name = "aifabric"'
+      metricName: { regex: namespace_(.+), replacement: $1 }
+---
+# Tenant membership = the `tenant` label of the EDA Interface CRs of the GPU rails (one per GPU NIC).
+# The orchestrator's bookings relabel exactly these objects (one per GPU NIC; no `tenant` = free), so
+# the dashboard's GPU tiles and per-tenant GPU counts follow a booking live. resource mode = one series per CR, value 1, CR labels as labels.
+apiVersion: prom.eda.nokia.com/v1alpha1
+kind: Export
+metadata:
+  name: aifabric-tenant
+  namespace: eda-system
+spec:
+  exports:
+    - resource:
+        group: interfaces.eda.nokia.com
+        version: v1
+        kind: interface
+        namespace: aifabric
+        labels: [role, tenant, gpu-server, server, rail]
+---
+# The Backend's overlay (EVPN since 2026-10-27, one Backend on all 8 switches; RouteLeaking = 1 kept for a
+# flip) and its state, for
+# the dashboard's Backend badge. String CR fields DO export with mappings on 26.8.2 (measured
+# 2026-10-26: mapping RouteLeaking->7 gave value 7); they did not on 26.4.1 (telemetry-stack §21f).
+apiVersion: prom.eda.nokia.com/v1alpha1
+kind: Export
+metadata:
+  name: aifabric-backend
+  namespace: eda-system
+spec:
+  exports:
+    - path: .namespace.resources.cr.aifabrics_eda_nokia_com.v1.backend
+      where: '.namespace.name = "aifabric"'
+      fields: [spec.type.overlay, status.operationalState]
+      mappings:
+        - { source: RouteLeaking, destination: "1" }
+        - { source: EVPN, destination: "2" }
+        - { source: Up, destination: "1" }
+        - { source: Degraded, destination: "2" }
+        - { source: Down, destination: "0" }
+        - { source: Unknown, destination: "3" }
+      metricName: { regex: namespace_(.+), replacement: $1 }

@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# aifabric-ssh — jump into the console of any aifabric lab node, or run a command on one
+# node or a whole group (role, stripe, Fabric, tenant). Sibling of eda-ssh / upgrade-ssh, made for
+# the GPU backend demo.
+#
+#   l2-1..2 / l1-1..6        (cx-kind=srl)   -> SR Linux CLI     (real ssh)
+#   gpu-<s>-g<G> (16 GPU VMs), cpu-1, ces-1,  (cx-kind=linux) -> server shell (kubectl exec)
+#   axelera-1, ocp-m1..3, ocp-s1..3
+#
+# SR Linux runs sshd on its mgmt address (TargetNode.spec.address = the sim pod's 10.244.x
+# IP). We reach it with an ssh ProxyCommand that tunnels a TCP relay through the in-cluster
+# eda-toolbox pod, so there is no port-forward and no host route to the pod network.
+# Password auth (admin / NokiaSrl1!) via sshpass.
+#
+# Cluster: env KUBECTL, else the one deploy.sh saved (.state/kubectl next to this script). Namespace: aifabric.
+# Needs jq, plus sshpass for the switches.
+#
+# ── AIFABRIC-SPECIFIC BEHAVIOUR ──────────────────────────────────────────────────
+#   * The list shows what each node is in the demo: spine, GPU-stripe rail leaf, non-GPU
+#     leaf (Backend stripe non-gpu: storage/CPU/mgmt, no GPU ports), GPU server, CPU / storage / accelerator server,
+#     OpenShift master / services.
+#   * PER-GPU TENANCY (owner 2026-10-26): every GPU is its own VM gpu-<s>-g<G> (GPU G of server
+#     gpu-<s>) with one NIC on rail G+1. TENANT is read live from EDA, from the same Interface label
+#     the Backend selects on (`tenant` on the GPU's rail Interface; cpu-1 = shared, no tenant); no label =
+#     "free" (unbooked, port parked). After a booking (orchestrator.py book/release) the list shows
+#     the new tenant at once.
+#   * --tenant N|free selects the VMs currently in tenant N (or free), the same way the Backend does;
+#     --server gpu-<s> selects the 4 GPU VMs of one physical server.
+#   * On a node that holds /etc/kubernetes/admin.conf (ocp-m1..3) KUBECONFIG is exported,
+#     so `kubectl get nodes` works straight away for the mgmt cluster; the tenant clusters'
+#     kubeconfigs are /root/tenant-1.kubeconfig and /root/tenant-2.kubeconfig on ocp-m1.
+#   * Server network config (rail subinterfaces, bond0, VLAN 2) lives in the sim pod and is
+#     lost on a pod restart: re-run `bash hosts.sh <server>` then (k8s nodes) `bash k8s.sh`.
+#
+# EXAMPLES
+#   aifabric-ssh                                   interactive picker
+#   aifabric-ssh l1-1                              SR Linux CLI
+#   aifabric-ssh gpu-1-g0                          shell on GPU VM gpu-1-g0 (GPU0 of server gpu-1)
+#   aifabric-ssh -l                                inventory with role + live tenant
+#   aifabric-ssh -c 'show network-instance summary' l1-1
+#   aifabric-ssh --stripe gpu1 -c 'info from state network-instance tenant-1 route-table ipv6-unicast statistics'
+#   aifabric-ssh --tenant 2 -c 'ip -6 -br addr show dev eth1.1'
+#   aifabric-ssh -c 'kubectl get nodes -o wide' ocp-m1
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+if [ -z "${KUBECTL:-}" ]; then
+  if [ -x "$HERE/.state/kubectl" ]; then KUBECTL="$HERE/.state/kubectl"; else KUBECTL=kubectl; fi
+fi
+CORE_NS=eda-system                  # where the cx sim pods + eda-toolbox live
+NS=aifabric                         # topology namespace of this lab
+SR_USER="${AIFABRIC_SSH_USER:-admin}"
+SR_PASS="${AIFABRIC_SSH_PASS:-NokiaSrl1!}"
+RELAY=/tmp/aifabric-ssh-relay.sh    # path INSIDE the eda-toolbox pod
+# Linux side: export the mgmt-cluster kubeconfig where it exists (ocp-m1..3), no-op elsewhere.
+KCFG='[ -f /etc/kubernetes/admin.conf ] && export KUBECONFIG=/etc/kubernetes/admin.conf'
+
+MODE=pick
+WANT_NODE=""
+CMD=""
+GROUP=""                            # switch | spine | leaf | stripe-gpu | non-gpu | gpu | server-gpu-N | ocp | host | tenant-N | tenant-free
+
+usage() {
+  cat <<'EOF'
+aifabric-ssh — console + scripted access to the aifabric GPU backend lab (ns aifabric)
+
+USAGE:
+  aifabric-ssh                        interactive picker (number or node name)
+  aifabric-ssh NODE                   connect: switch -> SR Linux CLI, server -> shell
+  aifabric-ssh -l | --list            inventory: role, live tenant, platform / uplinks
+  aifabric-ssh -c 'CMD' NODE          run CMD non-interactively, print clean output
+  aifabric-ssh --all-switch -c 'CMD'  run CMD on all 8 switches
+  aifabric-ssh --all-spine  -c 'CMD'  run CMD on spines l2-1, l2-2
+  aifabric-ssh --all-leaf   -c 'CMD'  run CMD on leaves l1-1..l1-6
+  aifabric-ssh --stripe gpu1 -c 'CMD' run CMD on the GPU stripe's rail leaves l1-1..l1-4 (gpu = same)
+  aifabric-ssh --non-gpu    -c 'CMD'  run CMD on the non-GPU leaves l1-5, l1-6 (storage/CPU/mgmt; = --stripe non-gpu;
+                                     --frontend still works)
+  aifabric-ssh --all-gpu    -c 'CMD'  run CMD in the 16 GPU VMs gpu-1-g0 .. gpu-4-g3
+  aifabric-ssh --server gpu-N -c 'CMD' run CMD in the 4 GPU VMs of physical server gpu-N
+  aifabric-ssh --tenant N|free -c 'CMD' run CMD in the VMs CURRENTLY in tenant N / free (live EDA labels)
+  aifabric-ssh --all-ocp    -c 'CMD'  run CMD in OpenShift nodes ocp-m1..3, ocp-s1..3
+  aifabric-ssh --all-host   -c 'CMD'  run CMD in all 25 servers (16 GPU VMs + 9 island hosts)
+  aifabric-ssh -h | --help
+
+  Creds (switches): admin / NokiaSrl1!   (override: AIFABRIC_SSH_USER / AIFABRIC_SSH_PASS)
+  Servers: root shell via kubectl exec. On ocp-m1..3 KUBECONFIG = mgmt cluster admin.
+
+HANDY ONE-LINERS:
+  aifabric-ssh --stripe gpu1 -c 'show network-instance summary'         tenant VRFs per rail leaf
+  aifabric-ssh -c 'show system lldp neighbor' l1-1                      which GPU sits on which port
+  aifabric-ssh -c 'show network-instance default protocols bgp neighbor' l2-1
+  aifabric-ssh -c 'show network-instance tenant-1 ipv6 route' l1-1      tenant-1 routes (L leaked, D DLB)
+  aifabric-ssh --stripe gpu1 -c 'info from state network-instance tenant-1 route-table ipv6-unicast statistics'
+    (SR Linux 26.7.1: the report is "<ni> ipv6 route"; "route-table ipv6-unicast summary" is gone)
+  aifabric-ssh --all-gpu -c 'ip -br addr show dev eth1.1; ip -br addr show dev eth1.2'   NIC addresses (VLAN 1 / 2)
+  aifabric-ssh --server gpu-2 -c 'ip -6 addr show dev eth1.1 scope global; ip -6 route show default'
+                                                                        SLAAC address + RA default route, 4 rails
+  aifabric-ssh -c 'kubectl get nodes -o wide' ocp-m1                    mgmt cluster
+  aifabric-ssh -c 'kubectl --kubeconfig /root/tenant-1.kubeconfig get nodes' ocp-m1
+EOF
+}
+
+die() { echo "aifabric-ssh: $*" >&2; exit "${2:-1}"; }
+require() { for c in "$@"; do command -v "$c" >/dev/null 2>&1 || die "missing required tool: $c"; done; }
+
+# ---- args -------------------------------------------------------------------
+while (($#)); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -l|--list) MODE=list; shift ;;
+    -c|--command) CMD="${2:?-c needs a command}"; shift 2 ;;
+    --all-switch) GROUP=switch; shift ;;
+    --all-spine)  GROUP=spine;  shift ;;
+    --all-leaf)   GROUP=leaf;   shift ;;
+    --all-gpu)    GROUP=gpu;    shift ;;
+    --all-ocp)    GROUP=ocp;    shift ;;
+    --all-host)   GROUP=host;   shift ;;
+    --stripe) case "${2:-}" in gpu|gpu1) GROUP=stripe-gpu ;; non-gpu|frontend|storage) GROUP=non-gpu ;; *) die "--stripe needs gpu1 or non-gpu" ;; esac; shift 2 ;;
+    --non-gpu|--frontend) GROUP=non-gpu; shift ;;
+    --tenant) [[ "${2:-}" =~ ^([0-9]+|free)$ ]] || die "--tenant needs a tenant number or free"; GROUP="tenant-$2"; shift 2 ;;
+    --server) [[ "${2:-}" =~ ^gpu-[0-9]+$ ]] || die "--server needs a GPU server name, e.g. gpu-2"; GROUP="server-$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) die "unknown flag: $1 (try -h)" ;;
+    *) [[ -n "$WANT_NODE" ]] && die "too many args ($WANT_NODE, $1)"; WANT_NODE="$1"; shift ;;
+  esac
+done
+[[ -n "$WANT_NODE" ]] && MODE=exec
+[[ -n "$GROUP"    ]] && MODE=group
+[[ -n "$GROUP" && -z "$CMD" ]] && die "--all-* / --stripe / --non-gpu / --server / --tenant require -c 'CMD'"
+require "$KUBECTL" jq
+
+# ---- discovery --------------------------------------------------------------
+# TSV rows: <node>\t<kind>\t<pod>\t<role>\t<tenant>\t<rail>\t<version>\t<podIP>
+# 🔴 Every field is non-empty ("-" placeholder): `IFS=$'\t' read` collapses consecutive
+#    tabs, so an empty middle field would shift the later ones (bit eda-ssh once).
+# role:   switches  spine | leaf-gpu | leaf-non-gpu   (TopoNode labels role + stripe; any stripe gpu<N> = leaf-gpu; stripe=frontend = the name until
+#                   2026-10-27, fabric=frontend = the 2026-10-26 layout)
+#         servers   gpu | cpu | storage | accelerator | ocp-master | ocp-services
+#                   (Interface labels: role=gpu ⇒ GPU VM <gpu-server>-g<rail-1>; role=server ⇒ server-role)
+# tenant: the `tenant` label of the host's Interface ("free" for an unlabelled GPU NIC).
+# rail:   switch = TopoNode label rail; GPU VM = its NIC's rail.   version: tag of the switch container image.
+# Order: spines, rail leaves, non-GPU leaves, GPU servers, CPU, storage, accelerator, OCP.
+discover() {
+  local pods topo ifs
+  pods="$("$KUBECTL" -n "$CORE_NS" get pods -l "cx-cluster-name=eda,cx-node-namespace=$NS" -o json 2>/dev/null)" \
+    || die "cannot list sim pods (is the cluster reachable with this kubectl? KUBECTL=$KUBECTL)"
+  topo="$("$KUBECTL" -n "$NS" get toponodes -o json 2>/dev/null || echo '{"items":[]}')"
+  ifs="$("$KUBECTL" -n "$NS" get interfaces.interfaces.eda.nokia.com -l 'role in (gpu,server)' -o json 2>/dev/null \
+         || echo '{"items":[]}')"
+  jq -r --argjson topo "$topo" --argjson ifs "$ifs" '
+      ($topo.items | map({key: .metadata.name, value: .metadata.labels}) | from_entries) as $tl
+      | ($ifs.items | map(.metadata.labels
+          | {srv: (if .role == "gpu" and .["gpu-server"] and .rail
+                   then "\(.["gpu-server"])-g\((.rail | tonumber) - 1)" else .server end),
+             role: (if .role == "gpu" then "gpu" else (.["server-role"] // "server") end),
+             rail: (if .role == "gpu" then .rail else null end),
+             tenant: .tenant})
+          | map(select(.srv != null)) | group_by(.srv)
+          | map(.[0].role as $r
+                | {key: .[0].srv,
+                   value: {role: $r, rail: .[0].rail,
+                           tenant: ([.[].tenant | select(. != null)] | unique | join("/")
+                                    | if . == "" and $r == "gpu" then "free" else . end)}})
+          | from_entries) as $sl
+      | [ .items[]
+          | select(.metadata.labels["cx-kind"] == "srl" or .metadata.labels["cx-kind"] == "linux")
+          | select(.status.phase == "Running" and .metadata.deletionTimestamp == null)
+          | (.metadata.labels["cx-chassis-name"] // .metadata.labels["cx-pod-name"]) as $n
+          | .metadata.labels["cx-kind"] as $k
+          | { node: $n,
+              kind: $k,
+              pod: .metadata.name,
+              created: .metadata.creationTimestamp,
+              role: (if $k == "srl"
+                     then (if $tl[$n].role == "spine" then "spine"
+                           elif ($tl[$n].stripe // "" | test("^gpu[0-9]*$")) then "leaf-gpu"
+                           elif $tl[$n].stripe == "frontend" then "leaf-non-gpu"
+                           elif $tl[$n].stripe then "leaf-" + $tl[$n].stripe
+                           elif $tl[$n].fabric == "frontend" then "leaf-non-gpu"
+                           else "leaf-unknown" end)
+                     else ($sl[$n].role // "server") end),
+              tenant: (if $k == "srl" then "-" else ($sl[$n].tenant // "" | if . == "" then "-" else . end) end),
+              rail: ($tl[$n].rail // $sl[$n].rail // "-"),
+              ip: (.status.podIP // "-"),
+              version: (if $k == "srl"
+                        then ([.spec.containers[] | select(.name == $n) | .image][0] // "-"
+                              | sub(".*:"; "") | sub("-[0-9]+$"; ""))
+                        else "-" end) } ]
+      | group_by(.node) | map(max_by(.created))
+      | sort_by([({"spine": 0, "leaf-gpu": 1, "leaf-non-gpu": 2, "gpu": 3, "cpu": 4, "storage": 5,
+                   "accelerator": 6, "ocp-master": 7, "ocp-services": 8}[.role] // 9), .node])[]
+      | [.node, .kind, .pod, .role, .tenant, .rail, .version, .ip] | @tsv' <<<"$pods"
+}
+
+role_name() {  # role rail -> short human role
+  case "$1" in
+    spine)        echo "spine" ;;
+    leaf-gpu)     echo "rail-$2 leaf" ;;
+    leaf-non-gpu) echo "non-GPU leaf" ;;
+    gpu)          echo "GPU VM" ;;
+    cpu)          echo "CPU server" ;;
+    storage)      echo "storage server" ;;
+    accelerator)  echo "accelerator" ;;
+    ocp-master)   echo "OpenShift master" ;;
+    ocp-services) echo "OpenShift services" ;;
+    *)            echo "$1" ;;
+  esac
+}
+
+role_detail() {  # role version node rail tenant -> what it does / how it is wired
+  case "$1" in
+    spine)        echo "7220 IXR-H5-64D, SR Linux $2, Backend stripe connector (all 84 ISLs)" ;;
+    leaf-gpu)     echo "7220 IXR-H5-64D, SR Linux $2, Backend stripe gpu1 (rail leaf)" ;;
+    leaf-non-gpu) echo "7220 IXR-H5-64D, SR Linux $2, Backend stripe non-gpu (storage/CPU/mgmt nodes, no GPU ports)" ;;
+    gpu)          if [[ "$5" == free ]]; then echo "GPU${3##*-g} of ${3%-g*}, NIC eth1 -> l1-$4 (rail $4), unbooked: port parked, in no cluster"
+                  else echo "GPU${3##*-g} of ${3%-g*}, NIC eth1 -> l1-$4 (rail $4), VLAN 1 backend + VLAN 2 frontend"; fi ;;
+    ocp-master)   echo "bond0 -> l1-5 + l1-6, mgmt cluster control plane, kubectl ready" ;;
+    ocp-services) echo "bond0 -> l1-5 + l1-6, Kamaji + hosted tenant control planes" ;;
+    *)            echo "bond0 -> l1-5 + l1-6" ;;
+  esac
+}
+
+# ---- listing / picker -------------------------------------------------------
+print_rows() {  # print_rows <rows> <numbered 0|1>
+  local node kind pod role tn rail ver ip i=1
+  if [[ "$2" == 1 ]]; then printf '  %3s  %-10s %-19s %-7s %s\n' "#" NODE ROLE TENANT DETAIL
+  else                     printf '  %-10s %-19s %-7s %s\n' NODE ROLE TENANT DETAIL; fi
+  while IFS=$'\t' read -r node kind pod role tn rail ver ip; do
+    if [[ "$2" == 1 ]]; then printf '  %3d  ' "$i"; else printf '  '; fi
+    printf '%-10s %-19s %-7s %s\n' "$node" "$(role_name "$role" "$rail")" "$tn" "$(role_detail "$role" "$ver" "$node" "$rail" "$tn")"
+    ((i++))
+  done <<<"$1"
+}
+
+list_mode() {
+  local rows; rows="$(discover)"; [[ -z "$rows" ]] && die "no running sim nodes in ns $NS"
+  printf '\n== %s ==\n' "$NS"
+  print_rows "$rows" 0
+  missing_nodes "$rows"
+  echo
+}
+
+# TopoNodes (switches) / SimNodes (servers) with no running sim pod right now: say so.
+missing_nodes() {
+  local have want n
+  have="$(cut -f1 <<<"$1")"
+  want="$( { "$KUBECTL" -n "$NS" get toponodes -o name; "$KUBECTL" -n "$NS" get simnodes -o name; } 2>/dev/null \
+           | sed 's|.*/||' || true)"
+  for n in $want; do
+    grep -qx "$n" <<<"$have" || printf '  %-10s %s\n' "$n" "NO RUNNING POD right now (restarting?)"
+  done
+}
+
+pick_interactively() {
+  local rows; rows="$(discover)"; [[ -z "$rows" ]] && die "no running sim nodes in ns $NS"
+  mapfile -t arr <<<"$rows"
+  local n="${#arr[@]}" node row
+  printf '\n== %s ==\n' "$NS" >&2
+  print_rows "$rows" 1 >&2
+  missing_nodes "$rows" >&2
+  printf '\n' >&2
+  local choice
+  while true; do
+    read -rp "Pick a number or node name [1-$n, q to quit]: " choice </dev/tty
+    [[ -z "$choice" || "$choice" == q || "$choice" == Q ]] && exit 0
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+      (( choice>=1 && choice<=n )) && { select_row "${arr[$((choice-1))]}"; return; }
+      echo "out of range: $choice" >&2; continue
+    fi
+    local hit=""
+    for row in "${arr[@]}"; do
+      node="${row%%$'\t'*}"
+      [[ "${node,,}" == "${choice,,}" ]] && hit="$row"
+    done
+    [[ -z "$hit" ]] && { echo "no node named '$choice'" >&2; continue; }
+    select_row "$hit"; return
+  done
+}
+
+select_row() {  # sets WANT_NODE SEL_KIND SEL_POD SEL_ROLE SEL_TENANT SEL_RAIL SEL_IP from one row
+  IFS=$'\t' read -r WANT_NODE SEL_KIND SEL_POD SEL_ROLE SEL_TENANT SEL_RAIL _ SEL_IP <<<"$1"
+}
+
+resolve_node() {
+  local rows match
+  rows="$(discover)"
+  match="$(awk -F'\t' -v nd="$WANT_NODE" '$1==nd' <<<"$rows" || true)"
+  if [[ -z "$match" ]]; then
+    if "$KUBECTL" -n "$NS" get toponode "$WANT_NODE" >/dev/null 2>&1 \
+       || "$KUBECTL" -n "$NS" get simnode "$WANT_NODE" >/dev/null 2>&1; then
+      die "$WANT_NODE has no running sim pod right now (restarting?); retry in a minute" 3
+    fi
+    { echo "node '$WANT_NODE' not found in ns $NS. Available:"
+      awk -F'\t' '{printf "  %s\n",$1}' <<<"$rows"; } >&2
+    exit 2
+  fi
+  select_row "$match"
+}
+
+banner_role() {  # one-line description for the connect banner
+  local r; r="$(role_name "$SEL_ROLE" "$SEL_RAIL")"
+  [[ "${SEL_TENANT:--}" != "-" ]] && r+=", tenant $SEL_TENANT"
+  echo "$r"
+}
+
+# ---- plumbing ---------------------------------------------------------------
+# The live pod IP from discovery is the ssh address (= TargetNode.spec.address, which can
+# lag a pod replacement by a few seconds, so it is only the fallback).
+node_address() {
+  if [[ -n "${SEL_IP:-}" && "$SEL_IP" != "-" ]]; then echo "$SEL_IP"; return; fi
+  "$KUBECTL" -n "$NS" get targetnode "$WANT_NODE" -o jsonpath='{.spec.address}' 2>/dev/null || true
+}
+
+# Toolbox lookup + relay install happen once per invocation, not once per node
+# (per node they made a 6-switch sweep take ~48 s in the upgrade lab).
+TB=""
+prepare_toolbox() {
+  [[ -n "$TB" ]] && return
+  TB="$("$KUBECTL" -n "$CORE_NS" get pods -l eda.nokia.com/app=eda-toolbox \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [[ -z "$TB" ]] && die "eda-toolbox pod not found in $CORE_NS"
+  install_relay "$TB"
+}
+
+install_relay() {  # idempotent; the ProxyCommand runs this inside eda-toolbox
+  "$KUBECTL" -n "$CORE_NS" exec -i "$1" -- sh -c "cat > $RELAY" <<'RELAY'
+exec 3<>/dev/tcp/$1/$2
+cat <&3 & PID=$!
+trap "kill $PID 2>/dev/null" EXIT
+cat >&3
+RELAY
+}
+
+ssh_opts() {
+  echo -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+       -o LogLevel=ERROR -o ConnectTimeout=15
+}
+
+# pick the node's own container, never the cxdp datapath sidecar
+linux_container() {
+  "$KUBECTL" -n "$CORE_NS" get pod "$SEL_POD" \
+    -o jsonpath='{range .spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null \
+    | grep -v '^cxdp$' | head -1
+}
+
+# ---- interactive ------------------------------------------------------------
+connect_console() {
+  case "$SEL_KIND" in
+    srl)
+      require sshpass ssh
+      local addr; addr="$(node_address)"
+      [[ -z "$addr" ]] && die "could not resolve an address for $WANT_NODE"
+      prepare_toolbox
+      echo "==> $WANT_NODE ($(banner_role), SR Linux) @ $addr — $SR_USER (Ctrl-D / quit to exit)" >&2
+      exec sshpass -p "$SR_PASS" ssh -tt $(ssh_opts) \
+        -o "ProxyCommand=$KUBECTL -n $CORE_NS exec -i $TB -- bash $RELAY %h %p" \
+        "${SR_USER}@${addr}" ;;
+    linux)
+      local c; c="$(linux_container)"
+      echo "==> $WANT_NODE ($(banner_role)) — root shell via kubectl exec (Ctrl-D to exit)" >&2
+      exec "$KUBECTL" exec -it -n "$CORE_NS" -c "${c:-$WANT_NODE}" "$SEL_POD" -- \
+        sh -c "$KCFG; cd /root 2>/dev/null; command -v bash >/dev/null 2>&1 && exec bash || exec sh" ;;
+    *) die "unknown node kind '$SEL_KIND' for $WANT_NODE" ;;
+  esac
+}
+
+# ---- non-interactive --------------------------------------------------------
+run_command() {
+  local addr c
+  case "$SEL_KIND" in
+    srl)
+      # SR Linux honours a real ssh exec channel: clean output, no banner.
+      require sshpass ssh
+      addr="$(node_address)"
+      [[ -z "$addr" ]] && die "cannot reach $WANT_NODE"
+      prepare_toolbox
+      # -n (stdin from /dev/null) is REQUIRED: without it ssh swallows the caller's
+      # stdin; in group mode the parallel jobs would then fight over the terminal.
+      sshpass -p "$SR_PASS" ssh -n $(ssh_opts) \
+        -o "ProxyCommand=$KUBECTL -n $CORE_NS exec -i $TB -- bash $RELAY %h %p" \
+        "${SR_USER}@${addr}" "$CMD" 2>&1 | tr -d '\r'
+      ;;
+    linux)
+      c="$(linux_container)"
+      "$KUBECTL" exec -n "$CORE_NS" -c "${c:-$WANT_NODE}" "$SEL_POD" -- sh -c "$KCFG; $CMD" 2>&1 </dev/null
+      ;;
+    *) die "unknown node kind '$SEL_KIND' for $WANT_NODE" ;;
+  esac
+}
+
+group_mode() {
+  local rows filter
+  case "$GROUP" in
+    switch)         filter='$2=="srl"' ;;
+    spine)          filter='$4=="spine"' ;;
+    leaf)           filter='$4 ~ /^leaf-/' ;;
+    stripe-gpu)     filter='$4=="leaf-gpu"' ;;
+    non-gpu)        filter='$4=="leaf-non-gpu"' ;;
+    gpu)            filter='$4=="gpu"' ;;
+    ocp)            filter='$4 ~ /^ocp-/' ;;
+    host)           filter='$2=="linux"' ;;
+    tenant-*)       filter="\$2==\"linux\" && \$5==\"${GROUP#tenant-}\"" ;;
+    server-*)       filter="\$4==\"gpu\" && \$1 ~ /^${GROUP#server-}-g/" ;;
+  esac
+  rows="$(discover | awk -F'\t' "$filter")"
+  [[ -z "$rows" ]] && die "no running nodes match --${GROUP/-/ }"
+  # One background job per node, each writing its own file; printed in list order
+  # once all finish. Sweep time ≈ the slowest node, not the sum of all of them.
+  local node kind pod role tn rail ver ip i=0 j tmp
+  tmp="$(mktemp -d)"; SWEEP_TMP="$tmp"; trap 'rm -rf "$SWEEP_TMP"' EXIT
+  grep -q $'\tsrl\t' <<<"$rows" && prepare_toolbox
+  while IFS=$'\t' read -r node kind pod role tn rail ver ip; do
+    echo "$node" >"$tmp/$i.name"
+    ( WANT_NODE="$node" SEL_KIND="$kind" SEL_POD="$pod" SEL_IP="$ip"
+      run_command >"$tmp/$i" 2>&1 || echo "  (command failed on $node)" >>"$tmp/$i" ) </dev/null &
+    ((++i))
+  done <<<"$rows"
+  wait
+  for ((j = 0; j < i; j++)); do
+    printf '\n===== %s =====\n' "$(cat "$tmp/$j.name")"
+    cat "$tmp/$j"
+  done
+}
+
+case "$MODE" in
+  list)  list_mode ;;
+  group) group_mode ;;
+  pick)  pick_interactively; if [[ -n "$CMD" ]]; then run_command; else connect_console; fi ;;
+  exec)  resolve_node;       if [[ -n "$CMD" ]]; then run_command; else connect_console; fi ;;
+esac

@@ -1,0 +1,16 @@
+# EDA's Prometheus exporter app (CRD exports.prom.eda.nokia.com, pod eda-px, HttpProxy prometheus-exporter):
+# the dashboard's Prometheus scrapes it. NOT part of a fresh EDA install (a fresh 26.8.2 Kind had no exporter,
+# 2026-11-02) => deploy.sh phase grafana creates this AppInstaller when the CRD is missing. v7.0.1 = the exporter of
+# EDA 26.8.2 (AIF_PROM_APP_VERSION overrides it). destroy.sh leaves the app installed (other users may rely on it).
+apiVersion: appstore.eda.nokia.com/v1
+kind: AppInstaller
+metadata:
+  generateName: aifabric-prom-exporter-install-
+  namespace: eda-system
+spec:
+  operation: install
+  apps:
+    - appId: prom.eda.nokia.com
+      catalog: eda-catalog-builtin-apps
+      version:
+        value: __PROM_APP_VERSION__

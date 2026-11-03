@@ -1,0 +1,70 @@
+# aifabric — EXAMPLE: IPv4 on GPU ports WITHOUT SLAAC, written by hand (owner 2026-11-02: "just manually you
+# create a few CRs that serves as an example. that's it"; "this is to showcase what it needs to be configured on
+# EDA manually if SLAAC is not used").
+#
+# What the Backend does by itself (addressAllocation, here PerTenantIPv6Pool, cannot be switched off): every booked
+# GPU port gets a /64 from its tenant's pool, the leaf ::1 and a router advertisement, so the host configures
+# itself (SLAAC, as these GPUs do since 2026-11-03).
+# It has no IPv4 option at all. For IPv4 an operator writes, PER GPU PORT, one Configlet like the three below:
+# the leaf side of a /31 on the Backend's own VLAN 1 subinterface (.1, already in the tenant's VRF, which carries
+# it to the tenant's other leaves over EVPN). The GPU side (the other half of the /31, gateway = the leaf) is
+# configured on the server (here hosts.sh, statically; no DHCP).
+# Why per port and by hand: a Configlet selects SWITCHES by label and carries literal JSON (no per-port values,
+# no wildcard paths, no EDA pool), so every port is one keyed path with its own address (dry-runs 1102-1107).
+# Address plan 10.201.<rail>.<2k>/31: 201 = stripe gpu1, rail = leaf l1-<rail>, k = 2(p-1)+(c-1) for
+# ethernet-1/<p>/<c>; leaf even, GPU odd => gpu-<s>-g<G> = 10.201.<G+1>.<2s-1>.
+#
+# Only 3 of the 12 booked ports, chosen clear of the booking scenes (RUNBOOK 3/4/9 move gpu-1-g3, gpu-3-g2/g3,
+# gpu-4-g2/g3): gpu-1-g0 + gpu-2-g1 = tenant-1 on rails 1 and 2 (IPv4 across the spines, qos-path.py rdma4),
+# gpu-3-g0 = tenant-2 on the same leaf as gpu-1-g0 (isolation).
+# NOT applied by deploy.sh (owner Q1 B 2026-11-02): apply by hand on a deployed lab, then address the GPUs:
+#   .state/kubectl apply -f manifests/gpu-ipv4.yaml && bash hosts.sh gpu-1-g0 gpu-2-g1 gpu-3-g0
+# remove: .state/kubectl delete -f manifests/gpu-ipv4.yaml && bash hosts.sh gpu-1-g0 gpu-2-g1 gpu-3-g0
+# CAVEATS (measured 2026-11-02): such a Configlet only works while its GPU is booked (a parked port has no
+# subinterface: the Configlet fails), and while it exists the GPU cannot be released ("cannot delete as there are
+# children present") => delete the Configlet before releasing that GPU. A tenant move keeps it (the IPv4 belongs
+# to the port; the IPv6 /64 comes from the new tenant's pool). Delete Configlets before the Backend (deploy.sh topology, destroy.sh do).
+# gpu-1-g0 (tenant-1): leaf 10.201.1.0/31 <-> GPU 10.201.1.1/31
+apiVersion: config.eda.nokia.com/v1
+kind: Configlet
+metadata:
+  name: gpu-ipv4-l1-1-ethernet-1-1-1
+  namespace: aifabric
+  labels: { ipv4: gpu-port }
+spec:
+  operatingSystem: srl
+  endpoints: [ l1-1 ]
+  configs:
+    - path: .interface{.name=="ethernet-1/1/1"}.subinterface{.index==1}.ipv4
+      operation: Update
+      config: '{"admin-state":"enable","address":[{"ip-prefix":"10.201.1.0/31","primary":[null]}]}'
+---
+# gpu-3-g0 (tenant-2): leaf 10.201.1.4/31 <-> GPU 10.201.1.5/31
+apiVersion: config.eda.nokia.com/v1
+kind: Configlet
+metadata:
+  name: gpu-ipv4-l1-1-ethernet-1-2-1
+  namespace: aifabric
+  labels: { ipv4: gpu-port }
+spec:
+  operatingSystem: srl
+  endpoints: [ l1-1 ]
+  configs:
+    - path: .interface{.name=="ethernet-1/2/1"}.subinterface{.index==1}.ipv4
+      operation: Update
+      config: '{"admin-state":"enable","address":[{"ip-prefix":"10.201.1.4/31","primary":[null]}]}'
+---
+# gpu-2-g1 (tenant-1): leaf 10.201.2.2/31 <-> GPU 10.201.2.3/31
+apiVersion: config.eda.nokia.com/v1
+kind: Configlet
+metadata:
+  name: gpu-ipv4-l1-2-ethernet-1-1-2
+  namespace: aifabric
+  labels: { ipv4: gpu-port }
+spec:
+  operatingSystem: srl
+  endpoints: [ l1-2 ]
+  configs:
+    - path: .interface{.name=="ethernet-1/1/2"}.subinterface{.index==1}.ipv4
+      operation: Update
+      config: '{"admin-state":"enable","address":[{"ip-prefix":"10.201.2.2/31","primary":[null]}]}'

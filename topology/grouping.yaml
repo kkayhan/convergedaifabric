@@ -1,0 +1,20 @@
+# aifabric — tiers for EDA's topology view (Topologies → Physical → Grouping "Spine / leaf").
+# Owner 2026-10-26 (Q1 C): the TopoNodes carry only the short `role` label, not EDA's long
+# `eda.nokia.com/role`, so Nokia's default grouping `eda-system/role` would put all 8 switches on
+# one row. This grouping reads the short label instead: spines on top, leaves below.
+# Must live in eda-system: EDA rejects it elsewhere ("TopologyGrouping is not permitted in user
+# namespaces", txn 840, 26.8.2) => cluster-wide in the Grouping dropdown; destroy.sh deletes it.
+# Name sorts before Nokia's `role` on purpose: the GUI opens the FIRST grouping by name (measured
+# 2026-10-26, display name ignored) => the topology page opens on these tiers without a click.
+apiVersion: topologies.eda.nokia.com/v1
+kind: TopologyGrouping
+metadata:
+  name: aifabric-spine-leaf
+  namespace: eda-system
+spec:
+  uiName: Spine / leaf
+  uiDescription: Tiers from the TopoNode label role - spines above leaves.
+  tierSelectors:
+    - { nodeSelector: [ role=spine ], tier: 1 }
+    - { nodeSelector: [ role=leaf ], tier: 2 }
+    - { tier: 2 }

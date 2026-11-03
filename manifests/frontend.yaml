@@ -1,0 +1,209 @@
+# aifabric — FRONTEND = VLAN 2 on the same GPU links as the backend (design: frontend network = a VLAN
+# on the HSI network; converged GPU NIC: VLAN 1 backend RDMA + VLAN 2 frontend).
+#
+# One EVPN-VXLAN VirtualNetwork per tenant + one shared services/management one:
+#   fe-tenant-1  10.21.0.0/24  gw 10.21.0.1 (anycast on every leaf)  GPU rail ports + CPU LAG of tenant 1
+#   fe-tenant-2  10.22.0.0/24  gw 10.22.0.1                          GPU rail ports + CPU LAG of tenant 2
+#   fe-services  10.20.0.0/24  gw 10.20.0.1                          mgmt cluster (ocp-m*, ocp-s*), CES, Axelera
+# Each = Router <vn>-vrf (ip-vrf) + BridgeDomain <vn>-bd (mac-vrf) + anycast IRB <vn>-irb + VLAN
+# <vn>-vlan2 (label-selected attachments). Router and BD need different names: both become a
+# switch network-instance named after the CR (same name => 'type ip-vrf conflict mac-vrf').
+#
+# Tenant <-> services, never tenant <-> tenant = LOCAL route leaking on every leaf
+# (Router.routeLeaking => SR Linux inter-instance-policies), only the IRB subnets leak:
+#   services VRF: exports 10.20.0.0/24 as leakable, imports 10.21.0.0/24 + 10.22.0.0/24
+#   tenant VRFs:  export their own /24 as leakable,  import 10.20.0.0/24 only
+#   => the leaf a host sits on leaks the host's /32 (ARP host route) into the other VRF and
+#      advertises that copy as RT-5 in the other VRF's own VNI. A packet therefore crosses the
+#      fabric in the SENDER's VRF and changes VRF on the DESTINATION leaf (measured 2026-10-27:
+#      traceroute gpu-1-g0 -> ces-1 = 10.21.0.1 on l1-1, 10.21.0.1 on l1-5 (tenant-1 VRF), host;
+#      the reply comes back to l1-1 in the services VNI). Only while the destination /32 is still
+#      unknown does the ingress leaf use the leaked /24 into its own services IRB (the services
+#      BridgeDomain is stretched to every leaf). Tenants never import each other's subnet.
+# WHY not route-target import (hub/spoke RTs, first try 2026-10-23): SR Linux installs an EVPN
+#   type-5 route in an ip-vrf only when the route's VNI equals the ip-vrf's own VNI (one VNI for
+#   ingress+egress, TD3-era restriction, SRL 26.7 EVPN-VXLAN L3 guide) => routes of another VRF
+#   arrive valid+best but are never used. All three VRFs are rendered on every leaf anyway.
+#
+# Attachments follow Interface labels (VLAN interfaceSelectors, list = OR, comma = AND):
+#   GPU rail port  role=gpu,tenant=N   (the label the orchestrator rewrites on a booking,
+#                                       so VLAN 2 moves together with the backend VRF)
+#   services LAGs server-role=ocp-master|ocp-services|storage|accelerator|cpu
+#   (cpu-1 = shared CPU node in the services network, no tenant: owner Q1 B 2026-10-27; until then it
+#    was tenant-1's CPU node via `role=server,tenant=1` on the tenant VLANs, removed with it)
+# IRB settings per eda-lab: learn unsolicited ARP + advertise dynamic ARP/ND + populate
+# dynamic host routes (silent hosts reachable); hostRoutePopulate.evpn deliberately OFF.
+#
+# EVPN CONTROL PLANE = the Backend's (owner 2026-10-27: one aifabric on all 8 switches, EVPN overlay): the
+# VirtualNetworks' EVPN routes ride the Backend's ISL eBGP EVPN sessions, nothing extra. From 2026-10-26 to
+# 10-27, with the Backend on RouteLeaking (EVPN off on its sessions), this file also carried an own iBGP EVPN
+# overlay with the spines as route reflectors (10 objects); a flip back to RouteLeaking would need it again.
+#
+# QoS: frontend-ingress (qos.yaml) on every VLAN 2 attachment AND on the 3 IRBs. WHY the IRBs: a routed
+# packet (tenant <-> services) is classified again when it enters the IRB; with no classifier there the
+# switch's built-in DSCP table applied (measured 2026-10-27: tenant-1 -> cpu-1 AF31 rode the lossless RDMA
+# queue on the uplinks, EF an unscheduled queue; bridged traffic was fine).
+apiVersion: routingpolicies.eda.nokia.com/v1
+kind: PrefixSet
+metadata:
+  name: fe-services
+  namespace: aifabric
+spec:
+  prefixes:
+    - { prefix: 10.20.0.0/24, startRange: 24, endRange: 32 }
+---
+apiVersion: routingpolicies.eda.nokia.com/v1
+kind: PrefixSet
+metadata:
+  name: fe-tenants
+  namespace: aifabric
+spec:
+  prefixes:
+    - { prefix: 10.21.0.0/24, startRange: 24, endRange: 32 }
+    - { prefix: 10.22.0.0/24, startRange: 24, endRange: 32 }
+---
+apiVersion: routingpolicies.eda.nokia.com/v1
+kind: Policy
+metadata:
+  name: fe-leak-services
+  namespace: aifabric
+spec:
+  defaultAction: { policyResult: Reject }
+  statements:
+    - name: services-subnet
+      match: { prefixSet: fe-services }
+      action: { policyResult: Accept }
+---
+apiVersion: routingpolicies.eda.nokia.com/v1
+kind: Policy
+metadata:
+  name: fe-leak-tenants
+  namespace: aifabric
+spec:
+  defaultAction: { policyResult: Reject }
+  statements:
+    - name: tenant-subnets
+      match: { prefixSet: fe-tenants }
+      action: { policyResult: Accept }
+---
+apiVersion: services.eda.nokia.com/v2
+kind: VirtualNetwork
+metadata:
+  name: fe-services
+  namespace: aifabric
+spec:
+  routers:
+    - name: fe-services-vrf
+      spec:
+        type: EVPNVXLAN
+        description: frontend VLAN 2 - shared services / management
+        nodeSelectors: [ role=leaf ]
+        routeLeaking: { exportPolicy: fe-leak-services, importPolicy: fe-leak-tenants }
+  bridgeDomains:
+    - name: fe-services-bd
+      spec:
+        type: EVPNVXLAN
+        description: frontend VLAN 2 - services subnet 10.20.0.0/24
+  irbInterfaces:
+    - name: fe-services-irb
+      spec:
+        router: fe-services-vrf
+        bridgeDomain: fe-services-bd
+        ipAddresses:
+          - ipv4Address: { ipPrefix: 10.20.0.1/24, primary: true, anycast: true }
+        ipv4: { learnUnsolicitedARP: Enabled }
+        evpnRouteAdvertisementType: { arpDynamic: true, ndDynamic: true }
+        hostRoutePopulate:
+          dynamic: { populate: true, datapathProgramming: true }
+        ingress: { qosPolicies: [ frontend-ingress ] }   # routed traffic is re-classified at the IRB
+  vlans:
+    - name: fe-services-vlan2
+      spec:
+        bridgeDomain: fe-services-bd
+        vlanID: "2"
+        ingress: { qosPolicies: [ frontend-ingress ] }   # manifests/qos.yaml: CS6 -> fc6, AF11 -> fc1, rest -> fc0
+        interfaceSelectors:
+          - server-role=ocp-master
+          - server-role=ocp-services
+          - server-role=storage
+          - server-role=accelerator
+          - server-role=cpu
+---
+apiVersion: services.eda.nokia.com/v2
+kind: VirtualNetwork
+metadata:
+  name: fe-tenant-1
+  namespace: aifabric
+spec:
+  routers:
+    - name: fe-tenant-1-vrf
+      spec:
+        type: EVPNVXLAN
+        description: frontend VLAN 2 - tenant 1
+        nodeSelectors: [ role=leaf ]
+        routeLeaking: { exportPolicy: fe-leak-tenants, importPolicy: fe-leak-services }
+  bridgeDomains:
+    - name: fe-tenant-1-bd
+      spec:
+        type: EVPNVXLAN
+        description: frontend VLAN 2 - tenant 1 subnet 10.21.0.0/24
+  irbInterfaces:
+    - name: fe-tenant-1-irb
+      spec:
+        router: fe-tenant-1-vrf
+        bridgeDomain: fe-tenant-1-bd
+        ipAddresses:
+          - ipv4Address: { ipPrefix: 10.21.0.1/24, primary: true, anycast: true }
+        ipv4: { learnUnsolicitedARP: Enabled }
+        evpnRouteAdvertisementType: { arpDynamic: true, ndDynamic: true }
+        hostRoutePopulate:
+          dynamic: { populate: true, datapathProgramming: true }
+        ingress: { qosPolicies: [ frontend-ingress ] }   # routed traffic is re-classified at the IRB
+  vlans:
+    - name: fe-tenant-1-vlan2
+      spec:
+        bridgeDomain: fe-tenant-1-bd
+        vlanID: "2"
+        ingress: { qosPolicies: [ frontend-ingress ] }   # manifests/qos.yaml: CS6 -> fc6, AF11 -> fc1, rest -> fc0
+        interfaceSelectors:
+          - role=gpu,tenant=1
+---
+apiVersion: services.eda.nokia.com/v2
+kind: VirtualNetwork
+metadata:
+  name: fe-tenant-2
+  namespace: aifabric
+spec:
+  routers:
+    - name: fe-tenant-2-vrf
+      spec:
+        type: EVPNVXLAN
+        description: frontend VLAN 2 - tenant 2
+        nodeSelectors: [ role=leaf ]
+        routeLeaking: { exportPolicy: fe-leak-tenants, importPolicy: fe-leak-services }
+  bridgeDomains:
+    - name: fe-tenant-2-bd
+      spec:
+        type: EVPNVXLAN
+        description: frontend VLAN 2 - tenant 2 subnet 10.22.0.0/24
+  irbInterfaces:
+    - name: fe-tenant-2-irb
+      spec:
+        router: fe-tenant-2-vrf
+        bridgeDomain: fe-tenant-2-bd
+        ipAddresses:
+          - ipv4Address: { ipPrefix: 10.22.0.1/24, primary: true, anycast: true }
+        ipv4: { learnUnsolicitedARP: Enabled }
+        evpnRouteAdvertisementType: { arpDynamic: true, ndDynamic: true }
+        hostRoutePopulate:
+          dynamic: { populate: true, datapathProgramming: true }
+        ingress: { qosPolicies: [ frontend-ingress ] }   # routed traffic is re-classified at the IRB
+  vlans:
+    - name: fe-tenant-2-vlan2
+      spec:
+        bridgeDomain: fe-tenant-2-bd
+        vlanID: "2"
+        ingress: { qosPolicies: [ frontend-ingress ] }   # manifests/qos.yaml: CS6 -> fc6, AF11 -> fc1, rest -> fc0
+        interfaceSelectors:
+          - role=gpu,tenant=2
+---

@@ -1,0 +1,3 @@
+# per-machine state written by deploy.sh: the saved connection (no password), the kubectl wrapper, deploy logs
+.state/
+__pycache__/

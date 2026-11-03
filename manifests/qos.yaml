@@ -1,0 +1,169 @@
+# aifabric — QoS for an INFERENCE cluster on converged GPU NICs (VLAN 1 RDMA + VLAN 2 frontend on the
+# same 400G GPU link = one channel of a 2x400G breakout). Owner decisions 2026-10-26: Q1 B four classes (bulk separate), Q2 A Configlet over
+# the Backend's scheduler for a 1:1 RDMA : frontend share + a Nokia feature request for a Backend
+# knob, Q3 B the hosts mark and the switches trust the marking.
+#
+#   class            DSCP on the wire        FC / queue      scheduler (every port)
+#   cluster control  48 CS6, host-marked     fc6 unicast-6   strict, capped at 10 % (shared with RoCE CNPs)
+#                    (API servers, etcd, kubelet, konnectivity, DNS: hosts.sh)
+#   inference RDMA   26 AF31, VLAN 1 only    fc3 unicast-3   WRR 50, lossless (PFC) + ECN — Backend, unchanged
+#   serving/default  0, and any other value  fc0 unicast-0   WRR 50 (Backend default 1 => ~2 % under RDMA load)
+#   bulk             10 AF11, host-marked    fc1 unicast-1   WRR 10 (model loading, storage, image pulls, logs)
+#   => under full contention after fc6: RDMA ≈ 45 %, serving ≈ 45 %, bulk ≈ 9 %; WRR is work-conserving,
+#      so any class takes the whole port while the others are idle.
+#
+# Trust (owner 2026-10-27, Q1 B / Q2 A / Q3 B): the operator owns the GPU hosts' OS and NIC, tenants run
+# pods only => the host marks and the switches trust the short lists below, tenant VLAN 2 the same as
+# services. HOST REQUIREMENT: the NIC tags only RoCE with PCP 3 — the Backend keys PFC on the GPU port on
+# the received PCP (pfc-mapping-profile edgeinterface-<backend>: dot1p 3, both VLANs), not on the class.
+#
+# Where each piece lands:
+#   frontend-ingress  IngressPolicy, DSCP 48 -> fc6, 10 -> fc1, everything else -> fc0 (SR Linux puts values a
+#                     dscp-policy does not list into fc0, measured). On every VLAN 2 attachment (VLAN
+#                     ingress.qosPolicies) AND on the 3 IRBs (frontend.yaml): routed traffic (tenant <->
+#                     services) is classified again at the IRB, and without a classifier there the built-in
+#                     DSCP table put AF31 into the lossless RDMA queue on the uplinks (measured 2026-10-27,
+#                     fixed same day). A host's AF31 or EF therefore travels as fc0, bridged or routed.
+#   frontend-egress   EgressPolicy, same scheduler shape as the GPU ports, on the 9 host LAGs of l1-5/l1-6 via
+#                     PolicyAttachment frontend-access. Their uplinks are Backend ISLs since 2026-10-27 (one
+#                     Backend on all 8 switches) and carry the Backend's ISL QoS + backend-qos-inference.
+#   qos-*-leaves      Configlets on the 6 leaves (the VTEPs; qos-gpu-leaves = stripe gpu1, qos-non-gpu-leaves =
+#                     stripe non-gpu). VLAN 2 is EVPN-VXLAN, and SR Linux by default
+#                     copies the inner DSCP into the outer header and classifies a terminating VXLAN packet
+#                     with its built-in table (measured 2026-10-26: a frontend AF31 packet rode the lossless
+#                     queue on all six hops, GPU port included). These two node-wide knobs fix that:
+#                     `qos rewrite-rules vxlan-outer-header-dscp-policy` = outer DSCP from the FC chosen at
+#                     the edge, `qos classifiers vxlan-default` = the decap classifier. EDA's QoS model has
+#                     neither, and the H5 has no multifield classifier (no ipEntry DSCP rewrite), hence
+#                     Configlets. GPU leaves keep fc3 <-> 26 so RDMA stays lossless when the Backend runs
+#                     the EVPN overlay (the Backend renders no VXLAN QoS of its own, dry-run txn 870).
+#                     qos-gpu-leaves also adds DSCP 10 -> fc1 to the Backend's VLAN 1 GPU-port classifier.
+#                     GOTCHA: a Configlet Update on a path the node lacks FAILS the txn ("cannot update
+#                     object that does not exist") => per-node-type Configlets, never a superset.
+#   backend-qos-inference  Configlet, priority 100, on all 8 Backend nodes: fc0 weight 1 -> 50, adds the bulk
+#                     queue to the Backend's scheduler, buffer profile and ISL classifier (DSCP 10 -> fc1).
+#                     WHY a Configlet: the Backend derives its EgressPolicy/IngressPolicy and re-renders them,
+#                     and its spec has no weight or class knob. Re-check this file after every Backend or
+#                     aifabrics app change (the derived object names are its anchors).
+apiVersion: qos.eda.nokia.com/v2
+kind: IngressPolicy
+metadata:
+  name: frontend-ingress
+  namespace: aifabric
+spec:
+  classifier:
+    entries:
+      - type: DSCP
+        dscpPolicyEntry: { dscpValues: [ { value: 0 } ], forwardingClass: fc0, dropProbabilityLevel: Low }
+      - type: DSCP
+        dscpPolicyEntry: { dscpValues: [ { value: 10 } ], forwardingClass: fc1, dropProbabilityLevel: Low }
+      - type: DSCP
+        dscpPolicyEntry: { dscpValues: [ { value: 48 } ], forwardingClass: fc6, dropProbabilityLevel: Low }
+---
+apiVersion: qos.eda.nokia.com/v2
+kind: EgressPolicy
+metadata:
+  name: frontend-egress
+  namespace: aifabric
+spec:
+  forwardingClassToQueueMapping:
+    - { forwardingClasses: [ fc0 ], queue: unicast-0 }
+    - { forwardingClasses: [ fc1 ], queue: unicast-1 }
+    - { forwardingClasses: [ fc6 ], queue: unicast-6 }
+  queueManagement:
+    - slopePolicyWeight: 0
+      queues:
+        - { queue: unicast-6, maximumBurstSizeBytes: 1024000, schedulerPeakRatePercent: 10 }
+    - slopePolicyWeight: 0
+      queues:
+        - { queue: unicast-0, maximumBurstSizeBytes: 1024000, schedulerWeight: 50 }
+    - slopePolicyWeight: 0
+      queues:
+        - { queue: unicast-1, maximumBurstSizeBytes: 1024000, schedulerWeight: 10 }
+---
+# Host LAGs of the non-GPU leaves (ESI-LAG on l1-5 + l1-6): output scheduler only, classification is
+# per VLAN. PolicyAttachment takes explicit Interface names (no selector) => add new host LAGs here.
+apiVersion: qos.eda.nokia.com/v2
+kind: PolicyAttachment
+metadata:
+  name: frontend-access
+  namespace: aifabric
+spec:
+  egressPolicy: frontend-egress
+  attachments:
+    - { interface: lag-axelera-1-local, interfaceType: Access }
+    - { interface: lag-ces-1-local, interfaceType: Access }
+    - { interface: lag-cpu-1-local, interfaceType: Access }
+    - { interface: lag-ocp-m1-local, interfaceType: Access }
+    - { interface: lag-ocp-m2-local, interfaceType: Access }
+    - { interface: lag-ocp-m3-local, interfaceType: Access }
+    - { interface: lag-ocp-s1-local, interfaceType: Access }
+    - { interface: lag-ocp-s2-local, interfaceType: Access }
+    - { interface: lag-ocp-s3-local, interfaceType: Access }
+---
+# Applied before the leaf Configlets: they use fc1, which this one defines on the GPU leaves (deploy.sh
+# applies object by object, one EDA transaction each).
+apiVersion: config.eda.nokia.com/v1
+kind: Configlet
+metadata:
+  name: backend-qos-inference
+  namespace: aifabric
+spec:
+  operatingSystem: srl
+  endpointSelectors: [ stripe=gpu1, stripe=non-gpu, role=spine ]
+  priority: 100
+  configs:
+    - path: .qos.queues
+      operation: Update
+      config: '{"queue":[{"name":"unicast-1","queue-index":1}]}'
+    - path: .qos.forwarding-classes
+      operation: Update
+      config: '{"forwarding-class":[{"name":"fc1","output":{"unicast-queue":"unicast-1"}}]}'
+    - path: .qos.classifiers.dscp-policy{.name=="ingress-backend-aifabric"}
+      operation: Update
+      config: '{"dscp":[{"value":10,"forwarding-class":"fc1","drop-probability":"low"}]}'
+    - path: .qos.buffer-management.buffer-allocation-profile{.name=="egress-backend-aifabric"}.queues
+      operation: Update
+      config: '{"queue":[{"queue-name":"unicast-1","maximum-burst-size":1024000}]}'
+    - path: .qos.scheduler-policies.scheduler-policy{.name=="egress-backend-aifabric"}.scheduler{.sequence==1}
+      operation: Update
+      config: '{"input":[{"id":"unicast-0","queue-name":"unicast-0","weight":50},{"id":"unicast-1","queue-name":"unicast-1","weight":10}]}'
+
+---
+apiVersion: config.eda.nokia.com/v1
+kind: Configlet
+metadata:
+  name: qos-gpu-leaves
+  namespace: aifabric
+spec:
+  operatingSystem: srl
+  endpointSelectors: [ stripe=gpu1 ]   # a future GPU stripe (gpu2, …) is added here
+  priority: 100
+  configs:
+    # the Backend's VLAN 1 classifier (GPU ports only) learns DSCP 10 too => AF11 = bulk on every port
+    - path: .qos.classifiers.dscp-policy{.name=="edgesubinterface-ingress-aifabric"}
+      operation: Update
+      config: '{"dscp":[{"value":10,"forwarding-class":"fc1","drop-probability":"low"}]}'
+    - path: .qos.classifiers
+      operation: Update
+      config: '{"vxlan-default":"vxlan-decap","dscp-policy":[{"name":"vxlan-decap","dscp":[{"value":0,"forwarding-class":"fc0","drop-probability":"low"},{"value":10,"forwarding-class":"fc1","drop-probability":"low"},{"value":26,"forwarding-class":"fc3","drop-probability":"low"},{"value":48,"forwarding-class":"fc6","drop-probability":"low"}]}]}'
+    - path: .qos.rewrite-rules
+      operation: Update
+      config: '{"vxlan-outer-header-dscp-policy":"vxlan-outer","dscp-policy":[{"name":"vxlan-outer","map":[{"forwarding-class":"fc0","dscp":0},{"forwarding-class":"fc1","dscp":10},{"forwarding-class":"fc3","dscp":26},{"forwarding-class":"fc6","dscp":48}]}]}'
+---
+apiVersion: config.eda.nokia.com/v1
+kind: Configlet
+metadata:
+  name: qos-non-gpu-leaves
+  namespace: aifabric
+spec:
+  operatingSystem: srl
+  endpointSelectors: [ stripe=non-gpu ]
+  priority: 100
+  configs:
+    - path: .qos.classifiers
+      operation: Update
+      config: '{"vxlan-default":"vxlan-decap","dscp-policy":[{"name":"vxlan-decap","dscp":[{"value":0,"forwarding-class":"fc0","drop-probability":"low"},{"value":10,"forwarding-class":"fc1","drop-probability":"low"},{"value":48,"forwarding-class":"fc6","drop-probability":"low"}]}]}'
+    - path: .qos.rewrite-rules
+      operation: Update
+      config: '{"vxlan-outer-header-dscp-policy":"vxlan-outer","dscp-policy":[{"name":"vxlan-outer","map":[{"forwarding-class":"fc0","dscp":0},{"forwarding-class":"fc1","dscp":10},{"forwarding-class":"fc6","dscp":48}]}]}'

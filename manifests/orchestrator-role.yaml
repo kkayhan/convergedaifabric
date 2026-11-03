@@ -1,0 +1,22 @@
+# GPU tenant orchestrator (EDA user gpu-orchestrator, orchestrator.py): least privilege for
+# booking GPUs for tenants (per GPU = per NIC Interface). Read everything in namespace aifabric (incl. switch state
+# for its before/after report); write ONLY Interface objects, whose `tenant` label decides the
+# tenant VRF of a GPU rail port. It cannot touch the Backend, the switches or other namespaces.
+# Applied with edactl from the toolbox by `orchestrator.py setup`; group gpu-orchestrator binds it.
+apiVersion: core.eda.nokia.com/v1
+kind: Role
+metadata:
+  name: gpu-orchestrator
+  namespace: aifabric
+spec:
+  description: "GPU tenant orchestrator: read namespace aifabric, write Interface labels (GPU bookings) only."
+  resourceRules:
+    - apiGroups: ["*"]
+      resources: ["*"]
+      permissions: read
+    - apiGroups: ["interfaces.eda.nokia.com/*"]
+      resources: ["interfaces"]
+      permissions: readWrite
+  tableRules:
+    - path: .namespace.node.**
+      permissions: read

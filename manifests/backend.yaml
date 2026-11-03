@@ -1,0 +1,91 @@
+# aifabric — ONE aifabrics Backend over all 8 switches, EVPN overlay (owner 2026-10-27: "one aifabric on all
+# 8 switches, with EVPN mode ... simpler design and simpler configuration but we will give up on dynamic load
+# balancing. that's fine, it's in the roadmap"). It builds the whole underlay (system IPs, ASNs, 84 ISLs, eBGP)
+# and the EVPN control plane; the frontend VLAN 2 (frontend.yaml) rides that same EVPN, nothing extra.
+# 2026-10-26 → 10-27 l1-5/l1-6 were a separate Fabric `frontend` with hand-made uplinks and the frontend
+# brought its own iBGP EVPN sessions (Backend on RouteLeaking); both gone with this file.
+#
+#   stripes          gpu1     (id 1) l1-1..l1-4 = the 4 rails of the GPU servers (TopoNode label stripe=gpu1;
+#                                    named `gpu` until 2026-10-27, owner: gpu1 leaves room for gpu2, …)
+#                    non-gpu  (id 2) l1-5, l1-6 = storage, CPU and management nodes (stripe=non-gpu; named
+#                                    `frontend` until 2026-10-27, renamed by the owner). Every
+#                                    Backend leaf must sit in a stripe; this one has no GPU ports, so it carries
+#                                    no tenant VRF, only the underlay + the frontend VirtualNetworks.
+#   stripeConnector  spines l2-1, l2-2 over all 84 ISLs (TopoLinks role=interSwitch)
+#   tenants          one gpuIsolationGroup = one ip-vrf per tenant. Membership = the
+#                    Interface label tenant=N on GPU rail ports (role=gpu); the Backend
+#                    re-evaluates Interface labels live. PER-GPU tenancy (owner 2026-10-26): one GPU
+#                    = one NIC = one Interface, so booking / moving a GPU = one label on one Interface
+#                    (orchestrator.py); no label = in no group = port parked (the free pool).
+#   overlay          EVPN: each tenant VRF = EVPN-VXLAN ip-vrf (type-5 routes, route target per tenant) on
+#                    the ISL eBGP sessions; the default instance holds only loopbacks and links.
+#                    Costs (RUNBOOK § EVPN or RouteLeaking, measured): no DLB for GPU traffic between
+#                    rails (VXLAN underlay DLB = SR Linux 27.3 roadmap, Nokia via the owner), ISL ip-mtu
+#                    4236 drops cross-rail packets of 4187-4200 bytes (RoCEv2 at 4096 fits).
+#                    RouteLeaking is still a one-field change, but it switches EVPN off on these sessions
+#                    and the frontend would lose every path between leaves.
+#   DLB              OFF (owner 2026-10-27: "since it's not supported on EVPN/vxlan networks yet (roadmap item on
+#                    srlinux) then we should disable DLB"). The CRD has no off switch (mode = Dynamic | PerPacket):
+#                    leaving `dynamicLoadBalancing` out = no `system load-balancing dynamic`, no `ip-load-balancing`
+#                    on any switch (txn 1023, 0 probes lost). To bring it back (SR Linux with DLB for VXLAN):
+#                      dynamicLoadBalancing: { mode: Dynamic, flowsetSize: 256, inactivityTimerUs: 50, samplingIntervalUs: 5 }
+#   rocev2QoS        lossless RoCEv2: ECN slope + PFC with deadlock detection.
+#   addressing       PerTenantIPv6Pool (owner 2026-11-03: "use pertenantipv6 subnet with /64 prefix length, and use
+#                    SLAAC if possible"): each tenant has its own SubnetAllocationPool below, and every GPU port the
+#                    tenant books gets the next free /64 of it (leaf = ::1, router advertisement with that /64), so
+#                    the address names the tenant: tenant-1 = fd00:1::/48, tenant-2 = fd00:2::/48 (mnemonic of the
+#                    frontend's 10.2<T>.0.0/24). The GPU configures itself by SLAAC (host-net.sh: router
+#                    solicitation, fixed host part ::2 by `ip token`). Moving a GPU to the other tenant = a /64 from
+#                    the other pool. A pool must hold one /64 per GPU the tenant may book: one /64 short fails the
+#                    WHOLE Backend transaction ("pool … is exhausted", dry-run 1393). Until 2026-11-03:
+#                    EDAManagedIPv6 (/64 computed from stripe, leaf, port: fd00:100:<leaf>01:<P>0<C>::/64).
+# The pools come first: the Backend refuses a pool that does not exist (dry-run 1395).
+apiVersion: core.eda.nokia.com/v1
+kind: SubnetAllocationPool
+metadata:
+  name: gpu-tenant-1-v6
+  namespace: aifabric
+spec:
+  segments:
+    - { subnet: "fd00:1::/48", subnetLength: 64 }
+---
+apiVersion: core.eda.nokia.com/v1
+kind: SubnetAllocationPool
+metadata:
+  name: gpu-tenant-2-v6
+  namespace: aifabric
+spec:
+  segments:
+    - { subnet: "fd00:2::/48", subnetLength: 64 }
+---
+apiVersion: aifabrics.eda.nokia.com/v1
+kind: Backend
+metadata:
+  name: aifabric
+  namespace: aifabric
+spec:
+  type:
+    overlay: EVPN
+  asnPool: asn-pool
+  systemPoolIPv4: systemipv4-pool
+  ipMTU: 4200
+  addressAllocation:
+    type: PerTenantIPv6Pool
+  stripes:
+    - { name: gpu1, stripeID: 1, gpuVLAN: 1, nodeSelectors: [ stripe=gpu1 ] }
+    - { name: non-gpu, stripeID: 2, gpuVLAN: 1, nodeSelectors: [ stripe=non-gpu ] }
+  stripeConnector:
+    name: spines
+    nodeSelectors: [ role=spine ]
+    linkSelectors: [ role=interSwitch ]
+  # list = OR; "a=b,c=d" in ONE string = AND
+  gpuIsolationGroups:
+    - { name: tenant-1, interfaceSelectors: [ "role=gpu,tenant=1" ], ipv6Pool: { name: gpu-tenant-1-v6 } }
+    - { name: tenant-2, interfaceSelectors: [ "role=gpu,tenant=2" ], ipv6Pool: { name: gpu-tenant-2-v6 } }
+  rocev2QoS:
+    ecnSlopeMinThresholdPercent: 5
+    ecnSlopeMaxThresholdPercent: 80
+    ecnMaxDropProbabilityPercent: 100
+    pfcDeadlockDetectionTimerMs: 750
+    pfcDeadlockRecoveryTimerMs: 750
+    queueMaximumBurstSizeBytes: 1024000
