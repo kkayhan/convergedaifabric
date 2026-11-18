@@ -34,9 +34,14 @@ locals {
 
   label_ports = { for g in keys(local.tenancy) : g => sort([for n, x in local.gpu_by_label : "${local.member[n].node} ${local.port_ifname[n]}" if x == g]) }
   lldp_ports  = { for g in keys(local.tenancy) : g => sort([for n, x in local.gpu_by_lldp : "${local.member[n].node} ${local.port_ifname[n]}" if x == g]) }
+  # GOTCHA (measured 2026-11-18): yamldecode() accepts a key listed twice and keeps the LAST line silently, so a
+  # duplicate "gpu-1-g0: free" below "gpu-1-g0: tenant-1" would release a booked GPU => count the keys in the text
+  file_keys  = [for m in regexall("(?m)^[ \t]*([A-Za-z0-9_-]+)[ \t]*:", file(var.tenancy_file)) : m[0]]
+  duplicates = sort(distinct([for k in local.file_keys : k if length([for x in local.file_keys : x if x == k]) > 1]))
   problems = concat(
+    [for g in local.duplicates : "${g}: listed more than once in ${var.tenancy_file} (only one line per GPU)"],
     [for g, t in local.tenancy : "${g}: unknown tenant '${t}' (tenants: ${join(", ", sort(keys(local.tenant_value)))}, or free)" if t != "free" && !contains(keys(local.tenant_value), t)],
-    [for g in keys(local.tenancy) : length(local.label_ports[g]) + length(local.lldp_ports[g]) == 0 ? "${g}: unknown GPU (no port in EDA's inventory, no LLDP neighbour of that name)" : "${g}: EDA's labels put it on [${join(", ", local.label_ports[g])}], LLDP sees it on [${join(", ", local.lldp_ports[g])}]"
+    [for g in keys(local.tenancy) : length(local.label_ports[g]) + length(local.lldp_ports[g]) == 0 ? "${g}: unknown GPU (no port in EDA's inventory, no LLDP neighbour of that name)" : "${g}: inventory and switches disagree: EDA's labels put it on [${join(", ", local.label_ports[g])}], LLDP sees it on [${join(", ", local.lldp_ports[g])}] => fix the cabling or the topology first"
     if !(length(local.label_ports[g]) == 1 && join(",", local.label_ports[g]) == join(",", local.lldp_ports[g]))],
   )
 
@@ -53,7 +58,7 @@ resource "terraform_data" "inventory_check" {
   lifecycle {
     precondition {
       condition     = length(local.problems) == 0
-      error_message = "REFUSED, nothing sent to EDA: inventory and switches disagree (fix the cabling or the topology first, or the file):\n${join("\n", local.problems)}"
+      error_message = "REFUSED, nothing sent to EDA:\n${join("\n", local.problems)}"
     }
   }
 }

@@ -1,204 +1,447 @@
-# Managing GPU tenants by label: EDA REST API vs Terraform
+# Giving GPUs to tenants with labels: EDA REST API or Terraform
 
-## What is being managed
+## In one minute
 
-On this fabric a GPU belongs to a tenant through **one label on its switch port**: the EDA Interface of the GPU's
-NIC carries `tenant=1` or `tenant=2`, or no `tenant` label when the GPU is free. Everything else follows that label
-by itself:
+A shared GPU cluster rents its GPUs to several users or teams, called **tenants**. Each GPU has its own network card,
+cabled to its own switch port. Giving a GPU to a tenant therefore means putting that switch port into the tenant's
+private network, and taking the GPU back means taking the port out again.
 
-- the aifabrics Backend puts the port into the tenant's VRF on VLAN 1 (backend RDMA);
-- the frontend VirtualNetwork attaches VLAN 2 to the tenant's frontend;
-- a free port carries nothing.
+In this fabric, Nokia EDA (the automation platform that configures the switches) does all the switch work. A
+person or a program only has to set **one label on the switch port**: `tenant=1` puts the GPU into tenant 1,
+removing the label frees the GPU. This document explains:
 
-The port's IPv6 /64 is fixed per port (`addressAllocation: EDAManagedIPv6`), so a GPU's gateway is the same wherever
-and whenever it is booked (table in `README.md`, "GPU gateways").
+1. where that label lives and what EDA configures on the switch because of it;
+2. how the fabric knows which GPU is behind which switch port, and how LLDP keeps that knowledge honest;
+3. two ways to automate the label, and every check each one makes before changing anything:
+   - a small program that talks to EDA's **REST API**;
+   - **Terraform**, the infrastructure-as-code tool;
+4. the pros and cons of each, and when to use which.
 
-The tenants themselves (isolation groups, VRFs, frontends) are pre-configured. Giving GPUs to tenants, taking them
-away, or growing a tenant is therefore nothing but adding, changing or removing that one label. This document
-compares two ways to automate it, both built and measured on this lab:
+Both tools were built and measured on this demo lab: Nokia EDA 26.8.2 with simulated SR Linux switches, 16 GPUs
+in 4 servers, and 2 tenants.
 
-| | EDA REST API (custom script) | Terraform |
+## The words used here
+
+| Term | Meaning |
+|---|---|
+| **GPU server, NIC, rail** | Each server has 4 GPUs. Each GPU has its own network card (NIC), cabled to a different switch: GPU 0 of every server to switch `l1-1`, GPU 1 to `l1-2`, and so on. Each such switch is a "rail". A GPU is named `gpu-<server>-g<index>`, e.g. `gpu-3-g2` = GPU 2 of server 3. |
+| **Leaf, spine** | The leaves are the switches the GPUs plug into; the spines connect the leaves to each other. |
+| **Tenant** | A user, team or company that rents GPUs. Tenants must never reach each other's GPUs. |
+| **VRF** | A private routing table on a switch. Each tenant has its own, which is what keeps tenants apart. |
+| **VLAN** | A tag that splits one cable into separate networks. Each GPU cable carries VLAN 1 (the GPU-to-GPU network, also called backend) and VLAN 2 (the frontend: storage and services). |
+| **EDA** | Nokia's Event-Driven Automation. You describe what you want as objects ("this port belongs to tenant 1"), and EDA works out and pushes the switch configuration, and keeps it in sync. |
+| **Object** | An entry in EDA's database, written in YAML, e.g. an `Interface` (one switch port) or a `Backend` (the whole GPU fabric design). |
+| **Label** | A `key=value` tag on an object, such as `tenant=1`. Labels don't configure anything by themselves; other objects **select** ports by their labels. |
+| **Transaction** | One change submitted to EDA. EDA applies all of it to the switches or none of it, and can **revert** it later. |
+| **Dry run** | A transaction that is only checked: EDA reports the exact switch configuration it would push, and pushes nothing. |
+| **LLDP** | A small protocol where every network card announces "I am X" to the switch port it is plugged into. |
+| **SLAAC** | A way for an IPv6 device to build its own address from what the switch announces, without DHCP. |
+| **REST API** | EDA's web interface for programs: they read and change objects over HTTPS. |
+| **Terraform** | A widely used tool that keeps infrastructure in line with a desired state written in files. `terraform plan` shows what it would change, `terraform apply` changes it, and a **state** file records what it manages. |
+
+## 1. Where the label is, and what it does
+
+### The label sits on the switch port's Interface object
+
+EDA keeps one `Interface` object per switch port. The port of GPU `gpu-1-g2` (switch `l1-3`, port `ethernet-1/1/1`)
+looks like this (trimmed):
+
+```yaml
+metadata:
+  name: l1-3-ethernet-1-1-1
+  labels:
+    role: gpu            # this port has a GPU behind it
+    gpu-server: gpu-1    # which server the topology says is cabled here
+    rail: "3"            # which GPU of that server (rail 3 = GPU 2)
+    tenant: "1"          # THE booking: this GPU belongs to tenant 1. No tenant label = free GPU
+spec:
+  members:
+    - node: l1-3                 # the switch
+      interface: ethernet-1-1-1  # the port
+status:
+  members:
+    - lldpOperationalState: Aligned               # what LLDP sees matches the cabling plan
+      neighbors: [ { node: gpu-1-g2, interface: eth1 } ]   # the card that LLDP sees on this port
+```
+
+Only the `tenant` label changes when a GPU is booked, moved or released. The other labels come from the cabling plan
+and never change.
+
+### Two objects read the label
+
+The fabric design is written once, up front, and selects ports by label:
+
+```yaml
+# Backend (the GPU fabric): one isolation group = one private network (VRF) per tenant
+gpuIsolationGroups:
+  - { name: tenant-1, interfaceSelectors: [ "role=gpu,tenant=1" ] }
+  - { name: tenant-2, interfaceSelectors: [ "role=gpu,tenant=2" ] }
+
+# Frontend network of tenant 1: VLAN 2 on every port that carries the same label
+vlans:
+  - name: fe-tenant-1-vlan2
+    spec: { vlanID: "2", interfaceSelectors: [ "role=gpu,tenant=1" ] }
+```
+
+So when a port gets `tenant=1`, it starts matching tenant 1's isolation group and tenant 1's frontend VLAN, and EDA
+configures it for both. When the label is removed, the port matches nothing and EDA removes that configuration.
+
+```mermaid
+flowchart LR
+  A["Operator or program<br/>sets tenant=1 on the<br/>GPU's switch port"] --> B["EDA"]
+  B -->|"Backend selects<br/>role=gpu,tenant=1"| C["Switch: VLAN 1 in tenant 1's VRF,<br/>gateway address, address offer,<br/>lossless RDMA settings"]
+  B -->|"frontend VLAN selects<br/>role=gpu,tenant=1"| D["Switch: VLAN 2 in<br/>tenant 1's frontend"]
+  C -->|"address offer (SLAAC)"| E["GPU network card<br/>builds its own address"]
+```
+
+### What EDA configures on the switch
+
+Booking the free GPU `gpu-3-g2` for tenant 1 adds 104 lines of configuration, and only on its own switch (`l1-3`).
+Nothing changes on any other switch: the other leaves learn the new address automatically through EVPN, the
+protocol the switches use to exchange tenant routes. Here are the lines, trimmed, with comments added:
+
+```
+interface ethernet-1/2/1 {                       # the GPU's port
+    ethernet { flow-control { receive false } }  # prerequisite for lossless RDMA
+    subinterface 1 {                             # VLAN 1 = GPU-to-GPU traffic (RDMA)
+        type routed
+        ip-mtu 4200
+        ipv6 {
+            address fd00:100:301:201::1/64       # the GPU's gateway
+            router-advertisement {               # the switch offers the network to the GPU:
+                router-role {
+                    prefix fd00:100:301:201::/64 { autonomous-flag true }   # "build your address in here"
+                }
+            }
+        }
+        vlan { encap { single-tagged { vlan-id 1 } } }
+    }
+    subinterface 2 {                             # VLAN 2 = frontend
+        type bridged
+        vlan { encap { single-tagged { vlan-id 2 } } }
+    }
+}
+network-instance tenant-1 {                      # tenant 1's private routing table (VRF)
+    interface ethernet-1/2/1.1 { }
+}
+network-instance fe-tenant-1-bd {                # tenant 1's frontend network
+    interface ethernet-1/2/1.2 { }
+}
+qos {                                            # quality of service for RDMA
+    interfaces {
+        interface ethernet-1/2/1 {
+            pfc { pfc-enable true }              # pause frames: RDMA traffic is never dropped
+            output { scheduler { scheduler-policy egress-backend-aifabric } }   # + buffer and queue profiles
+        }
+        interface ethernet-1/2/1.1 { input { classifiers { dscp-policy edgesubinterface-ingress-aifabric } } }
+        interface ethernet-1/2/1.2 { input { classifiers { dscp-policy frontend-ingress } } }
+    }
+}
+```
+
+- **Releasing** a GPU removes exactly these lines.
+- If it was the tenant's last GPU on that switch, EDA also removes the tenant's whole routing instance from the
+  switch: 145 lines for `gpu-1-g2`, tenant 1's only GPU on `l1-3`.
+- A free port carries no tenant network at all.
+
+The address is fixed per port. EDA computes each GPU port's network from the switch and the port:
+`fd00:100:<leaf>01:<port>0<channel>::/64`. The switch is always `::1` of it, which is the GPU's gateway. A GPU gets
+the same network and gateway every time it is booked, and keeps them when it moves to the other tenant; only the VRF
+changes. `README.md` lists the gateway of all 16 GPUs.
+
+### What the GPU does by itself
+
+The GPU's operating system accepts the switch's address offer and builds its address from it (SLAAC; the host part
+comes from the card's hardware address). In the lab, a small agent on each GPU does the rest:
+
+- it pings its gateway every second, which shows the GPU is reachable and keeps the switch's address table fresh;
+- it drops the address when the switch stops offering it.
+
+Nobody configures anything on the GPU when it is booked or released. The frontend (VLAN 2) address is still static
+in this lab; a helper (`hosts.sh --follow`) sets it when a label changes.
+
+## 2. Which switch port belongs to which GPU
+
+The label goes on a **switch port**, but the operator thinks in **GPUs** ("give `gpu-3-g2` to tenant 1"). Something
+has to translate GPU to port, and that translation must be right. Otherwise the tenant gets a different GPU than the
+one it paid for: possibly a GPU on the wrong rail, or one already in use by someone else.
+
+### Two sources that must agree
+
+1. **EDA's inventory: the plan.** The cabling plan (EDA's topology) says which card is cabled to which port. EDA
+   copies it onto the port as the labels `gpu-server` and `rail`. From these, `gpu-server=gpu-3` + `rail=3` = GPU 2
+   of server 3 = `gpu-3-g2`.
+2. **LLDP: the reality.** Every GPU's card announces its name on its cable, and the switch records who it sees on
+   each port. EDA collects this for every port; it is the `neighbors` field above.
+
+Both tools refuse to change anything unless both sources name the same GPU on the same port.
+
+### When they disagree: crossed cables
+
+Suppose the cables of `gpu-4-g2` and `gpu-4-g3` were swapped during installation. The plan says `gpu-4-g2` is on
+`l1-3 ethernet-1/2/2`, but LLDP sees `gpu-4-g3` there, and the other way round on `l1-4`. Tested on the lab:
+
+- **EDA notices within about 20 s.**
+  - Both ports' LLDP state turns from `Aligned` to `Misaligned`.
+  - EDA raises a **major alarm** per cable, for example: "Expected neighbor on interface l1-4-ethernet-1-2-2 is
+    [gpu-4-g3, eth1] but found [gpu-4-g2, eth1]", with the advice "Verify cabling…". The alarm clears by itself once
+    the cabling is right.
+- **EDA does not stop you.** A booking on a misaligned port still passes EDA's dry run, because to EDA a label is
+  just a label. Booking `gpu-4-g2` by the plan would label `l1-3 ethernet-1/2/2`, and the GPU really behind that
+  port, `gpu-4-g3`, would join the tenant.
+- **Both tools stop here.** They refuse before sending anything, and show both views:
+
+  ```
+  REFUSED, nothing sent to EDA:
+  gpu-4-g2: inventory and switches disagree: EDA's labels put it on l1-3 ethernet-1/2/2,
+  LLDP sees it on l1-4 ethernet-1/2/2 => fix the cabling or the topology first
+  ```
+
+- **A GPU whose card is silent** (no LLDP neighbour on its port: card down, or LLDP not running) is refused the same
+  way: nothing proves which GPU is there.
+
+The refusal is deliberate: a crossed cable has to be fixed, not booked around.
+
+In this lab each GPU runs as its own small virtual machine, so its LLDP name is the GPU name. On real GPU servers
+LLDP names the server and the network-card port, and the GPU index comes from which card is wired to which GPU. The
+check works the same way.
+
+### Why not use the IPv6 addresses for this?
+
+The switch also learns each GPU's IPv6 address and card hardware address (IPv6 neighbour discovery), but that
+cannot identify a GPU before it is booked:
+
+- it carries no name;
+- a free port has no network, so no address appears on it at all.
+
+It is used afterwards, as proof. Once a booking is done, the switch must have learned an address in that port's
+network, from the card whose hardware address LLDP reported. That proves the right card took the address, in the
+right tenant's VRF.
+
+## 3. How each approach sets the label
+
+Both tools change only the `tenant` label, and EDA turns the label into switch configuration exactly the same way
+whichever tool set it. Both log in as their own limited EDA user, which may read the fabric and change port objects,
+and nothing else. So EDA's Transactions page always shows which tool made a change, and neither tool can touch the
+fabric design.
+
+### Approach A: a program on EDA's REST API (`automation/gpu-tenant.py`)
+
+The operator asks for an action; the program carries it out and stops when the GPU works.
+
+```bash
+python3 automation/gpu-tenant.py assign tenant-1 gpu-3-g2     # book (gpu-3 alone = all 4 GPUs of server 3)
+python3 automation/gpu-tenant.py assign tenant-2 gpu-3-g2 --move
+python3 automation/gpu-tenant.py unassign gpu-3-g2              # release
+python3 automation/gpu-tenant.py apply automation/tenancy.yaml  # make the fabric match a list of all GPUs
+python3 automation/gpu-tenant.py list                           # every GPU: port, LLDP check, tenant, address
+```
+
+**What happens on `assign tenant-1 gpu-3-g2`**
+
+1. **Log in** to EDA. Two runs that start at the very same moment can be refused by EDA's login service, so the
+   program retries.
+2. **Read the live state** through the REST API:
+   - every GPU port with its labels;
+   - every port's LLDP neighbour;
+   - the list of tenants, read from the Backend's isolation groups.
+3. **Check everything** (below). If any check fails, the whole command is refused and nothing is sent.
+4. **Prepare the change**: for each port, "set `tenant` to `1`", preceded by a condition: "only if this port's labels
+   are still exactly what I just read". If someone else changed the port in the meantime, EDA rejects the whole
+   change. This is called compare-and-swap.
+5. **Dry run**: EDA checks the change and names the switches it would touch.
+6. **Commit**: the same change as **one transaction for all GPUs of the command**. Either all of them change, or
+   none.
+7. **Confirm**:
+   - the switch shows the port in tenant 1's VRF;
+   - the switch has learned the GPU's address from the right card;
+   - the labels are re-read once more. If another operator changed the same GPU during the run, the program says so
+     and ends with an error.
+
+Exit codes tell a calling system what happened: 0 done, 1 refused by EDA or overtaken by someone else, 2 refused
+before anything was sent.
+
+### Approach B: Terraform with Nokia's EDA providers (`automation/terraform/`)
+
+The operator edits the desired state, a file listing all 16 GPUs, and asks Terraform to make EDA match it.
+
+```yaml
+# automation/tenancy.yaml (excerpt)
+gpu-3-g1: tenant-2
+gpu-3-g2: tenant-1      # was: free
+gpu-3-g3: free
+```
+
+```bash
+cd automation/terraform
+python3 setup.py     # once per lab: Terraform's EDA user, connection settings, download of Nokia's providers
+terraform plan       # show the difference and EDA's dry-run verdict
+terraform apply      # make the change
+```
+
+**What happens on `terraform plan`, then `terraform apply`**
+
+1. **Read the live state** with Nokia's providers (Terraform plug-ins, one per EDA application):
+   - every GPU port, with its labels and its LLDP neighbour;
+   - the list of tenants, from the Backend.
+2. **Check everything** (below). If any check fails, the plan stops with an error and nothing is sent.
+3. **Compare** each port's current `tenant` label with the file. Only the differences become changes. The first
+   plan also **adopts** the 16 ports into Terraform. They already exist, so Terraform takes them over instead of
+   creating them, and from then on manages only their `tenant` label.
+4. **Dry run**: the plan shows EDA's verdict on exactly these changes, and which switches they touch.
+5. **Apply**: Nokia's provider writes each changed port object to EDA separately, so **each port is its own
+   transaction**.
+6. **Afterwards**: on the next plan, Terraform reads the switches. Are the booked ports in their tenant's VRF, and
+   have the GPUs taken their addresses? If not, it prints a warning. It does not wait for the fabric.
+
+Terraform is also protected against deleting ports. Removing a GPU from Terraform's control would normally delete
+the object, and here that object is a switch port, so the project forbids it. To release a GPU, set it to `free`.
+
+### All the checks, side by side
+
+| Check before changing a label | REST API program | Terraform |
 |---|---|---|
-| Tool | `automation/gpu-tenant.py` | `automation/terraform/` |
-| The operator says | `gpu-tenant.py assign tenant-1 gpu-3-g2` | `gpu-3-g2: tenant-1` in `automation/tenancy.yaml`, then `terraform plan`, `terraform apply` |
-| Talks to EDA through | EDA's Transaction API directly | Nokia's EDA Terraform providers (one per EDA app) |
-| EDA identity | user `gpu-orchestrator` | user `gpu-terraform` |
+| The tenant exists (read from the Backend) | yes, refused before EDA | yes, the plan stops |
+| The GPU exists (a port in the inventory, or an LLDP neighbour, has its name) | yes | yes |
+| The plan and LLDP put the GPU on the same port (exactly one port) | yes, for the GPUs in the command | yes, for **every** GPU in the file |
+| The GPU's card is alive (an LLDP neighbour is present) | yes | yes |
+| Each GPU is listed only once | yes | yes, checked separately: the YAML reader alone would silently keep the last of two lines |
+| The GPU name is well formed | yes | a misspelt name is refused as an unknown GPU |
+| **Is a label already set?** The current label is read live and compared | yes, just before acting | yes, Terraform refreshes from EDA during the plan |
+| Already in the requested tenant: nothing is sent | yes | yes |
+| The GPU belongs to another tenant | refused unless `--move` (or `apply` of a file) | changed if the file says so (visible in the plan) |
+| EDA's dry run must pass first | yes, always | yes, during the plan |
+| Nobody changed the port since it was read (compare-and-swap) | yes: EDA rejects a stale change | **no**: applying a saved plan overwrote a label someone changed in between, without a warning |
+| Two operators at the same moment | compare-and-swap, plus a re-check after the commit | Terraform's state lock refuses the second run, but only for operators sharing the same state |
+| A port object can never be deleted | the program only edits labels | `prevent_destroy` refuses any plan that would |
+| After the change: switch configured, GPU addressed | waited for and proven | warning on the next plan only |
 
-## The same rules in both
+### Two ways to build the Terraform side
 
-Both tools enforce the same safety rules, so the comparison is about the tools, not about two designs.
+There are two ways to connect Terraform to EDA, and they behave differently.
 
-- **The switch decides which port a GPU is on.** LLDP on the leaf port names the host behind it. EDA's inventory
-  labels on that port (`gpu-server`, `rail`) must say the same. If they disagree, or the port has no LLDP neighbour,
-  the change is refused before anything is sent to EDA, with both views printed. A crossed cable or a wrong topology
-  entry is reported, never booked over.
-- **Proof after the change.** IPv6 neighbour discovery cannot name a GPU (it carries a MAC and an address), and a
-  free port has none (no subinterface, no router advertisement). So it is used as proof afterwards: the leaf has
-  learned the NIC with the MAC that LLDP reported, with an address in the port's /64, in the tenant's VRF.
-- **EDA dry run first.** EDA computes the exact switch changes before anything is committed.
-- **Least privilege.** Both users are in the role `aifabric:gpu-orchestrator`: read the namespace, write Interfaces,
-  nothing else.
-- **Nothing to do on the GPU host.** Every GPU VM runs a small agent (`host-agent.sh`) that reacts only to what its
-  port advertises: SLAAC address on a booking, kept on a move, dropped on a release. It needs no access to EDA. The
-  frontend VLAN 2 address is still static and set by `hosts.sh --follow`.
+- **Nokia's typed resources** (this lab). Terraform holds each port object and reads it back on every plan.
+  - So it **sees and reverts** any label changed elsewhere: in EDA's GUI, by another tool, or by an EDA revert.
+  - It writes each object through that application's REST interface, not through EDA's transaction service (stated
+    in Nokia's EDA 26.8 documentation). So every port is its own transaction, and EDA's history describes each one
+    only as "REST".
+  - It owns the whole port object, which is why adopting existing ports needs care.
+  - Nokia's typed resources have no dry run; the plan adds one through a direct REST call.
+- **Terraform posting EDA transactions over REST** (used in another EDA demo, "nebnok").
+  - Many objects can go into one transaction, each with a clear description, and four-eyes merge requests work.
+  - But Terraform then only remembers the transactions it sent, not the labels, so it is **blind** to changes made
+    elsewhere.
+  - Undoing relies on EDA reverts, which fail when EDA has bundled transactions sent at the same moment, so explicit
+    undo transactions are needed.
 
-## Approach 1: the EDA REST API (custom script)
+With either design, Terraform can own more than labels. In the nebnok demo one `terraform apply` onboards a whole
+tenant: network, routing, 4 GPU bookings, a tenant login and validation checks, 27 resources. That apply took about
+2 minutes and the removal under 1 minute. Growing a tenant from 4 to 6 GPUs touched only the 2 new ones: 0 of 599
+pings were lost on a GPU that stayed.
 
-**The idea.** The tool is an EDA API client written for this one job. It speaks the operator's language, sends
-EDA exactly the change wanted, as one transaction, and finishes when the GPU really works. The desired state is
-whatever the last command said; EDA itself is the only record.
+## 4. Side by side: measured on the lab
 
-**How `gpu-tenant.py` works**
-
-1. Logs in to EDA's Keycloak as `gpu-orchestrator`. Two runs starting at the same instant collide there, so it
-   retries with a random back-off.
-2. Reads the live fabric through EDA's REST API:
-   - the GPU ports (Interfaces with label `role=gpu`);
-   - the LLDP neighbour of every port (EQL query);
-   - the tenants, from the Backend's isolation groups.
-3. Checks every GPU named in the command:
-   - the GPU exists, the tenant exists, and the GPU's port agrees between LLDP and EDA's labels;
-   - a GPU that belongs to another tenant may only be taken with `--move`.
-4. Builds one JSON patch per port: add, change or remove the `tenant` label. Each patch starts with a `test` of the
-   labels it just read (compare-and-swap): if someone changed that port in the meantime, EDA refuses the whole
-   transaction.
-5. Sends all patches as **one dry-run transaction**, then the same as **one real transaction**. All GPUs of the
-   command change together, or none do.
-6. Waits until the switches show the port in the tenant's VRF and the leaf has learned the GPU's NIC there. Then it
-   re-reads the labels, to report a GPU that another operator changed during the run.
-
-Commands: `list`, `assign <tenant> <gpu…>`, `unassign <gpu…>`, `apply tenancy.yaml` (make the fabric match the
-file), plus `--dry-run`. Exit code 0 = done, 1 = EDA refused or someone else changed the GPU, 2 = refused before EDA.
-
-## Approach 2: Terraform with Nokia's EDA providers
-
-**The idea.** The desired state lives in a file, `tenancy.yaml`, one line per GPU. Terraform compares it with what
-EDA has, shows the difference (`plan`) and makes EDA match it (`apply`). It also notices changes made by anyone
-else, and puts the file's state back.
-
-**How the Terraform project works**
-
-1. `setup.py`, once per lab: creates the EDA user `gpu-terraform` and writes `terraform.tfvars` (EDA address and the
-   client secret of EDA's login client). Terraform then never needs the Keycloak admin. It also runs
-   `terraform init`, which downloads Nokia's providers.
-2. `inventory.tf` reads the 16 GPU ports with Nokia's `interfaces-v1_interface_list` data source. That includes
-   EDA's LLDP view of each port. It reads the tenants with the `aifabrics-v1_backend` data source, then runs the
-   strict check. Any problem fails the plan before anything is sent.
-3. `main.tf` puts each GPU port under Terraform as Nokia's typed resource `interfaces-v1_interface`:
-   - **imported**, because the ports already exist (the topology made them);
-   - Terraform manages **only the `tenant` label**; spec, status and other labels are left to EDA;
-   - `prevent_destroy`, because destroying such a resource would delete the switch port's Interface.
-   To release a GPU you set it to `free`; `terraform destroy` is refused on purpose.
-4. `preview.tf` makes `terraform plan` show **EDA's own dry run** of exactly the planned label changes. Nokia's typed
-   resources cannot dry-run, so this is a plain REST call, and Nokia's `core-v1` data sources read EDA's verdict.
-5. `terraform apply`: the provider writes each changed port through the Interface app's REST API. **That is one EDA
-   transaction per port.**
-6. `checks.tf` reads the switches on every plan: is each booked port in its tenant VRF, and has the leaf learned the
-   GPU's NIC? These checks only warn. Terraform does not wait for the fabric to converge.
-
-## Measured on this lab (18 November 2026, EDA 26.8.2, Talos)
-
-| | REST API script | Terraform |
+| | REST API program | Terraform (label only) |
 |---|---|---|
-| Book 1 free GPU | 6.5-8.8 s until the GPU's NIC is proven on its port | plan 5.3 s (incl. EDA dry run) + apply 5.3 s |
-| Move a GPU to the other tenant | 4.3 s (the address stays) | plan 5.2 s + apply 5.3 s |
+| Book one free GPU | 5.4-8.8 s, until the GPU is proven on its port | plan 5.3 s + apply 5.3 s |
+| Move a GPU to the other tenant | 4.3 s (address kept) | plan 5.2 s + apply 5.3 s |
 | Release a GPU | 3.2 s | plan 5.6 s + apply 5.4 s |
-| Several GPUs in one go | 4 GPUs = one transaction, 6.5 s | 3 GPUs = 3 transactions (EDA bundled 2), apply 8.6 s ¹ |
-| Back to the file's state | `apply tenancy.yaml`, one transaction, 3.2-3.7 s | plan + apply, one transaction per changed port |
-| Unknown GPU or tenant, bad name | refused before EDA (exit 2) | the plan fails before EDA |
-| Crossed cables: LLDP disagrees with EDA's labels | that GPU refused, both views shown; other GPUs still bookable | the **whole plan** refused while any GPU in the file is affected |
-| Label changed outside the tool (GUI, kubectl) | `list` shows it; `apply --dry-run` shows the difference to the file; `apply` fixes it | the next plan shows the drift by itself; `apply` reverts it |
-| Two operators at once | compare-and-swap refuses the later change; if EDA bundles both commits, the loser is detected afterwards and exits 1 | second `apply` in the same directory: "state lock" error; separate copies: no protection without a shared state backend |
-| What EDA's Transactions page says | "gpu-tenant.py: assign to tenant-1: gpu-3-g2 tenant-1" + its dry run | the dry run is described; each commit only says "REST" |
-| Code | 354 lines of Python + a 133-line shared login library | 251 lines of HCL in 8 files + a 57-line setup script |
-| Needs | python3 3.9+, standard library only | Terraform (123 MiB) + 4 providers (89 MiB) from the Terraform registry; an air-gapped site needs a provider mirror |
+| Book 4 GPUs at once | one transaction, 6.5 s | one transaction per GPU (EDA bundled some), about 9 s |
+| One of them is miscabled | that GPU refused, the rest can be booked | the whole plan refused |
+| A label changed in the GUI | shown by `list`; only `apply --dry-run` shows it differs from the file | the next plan shows it and the apply reverts it |
+| EDA reverts the tool's change | the revert stands; the program keeps no memory | the next plan sees it and re-applies the file |
+| Same GPU changed by two operators | the later change is refused by EDA, or detected right after | same working copy: locked out; a stale saved plan: silently overwrites |
+| EDA's history | "gpu-tenant.py: assign to tenant-1: gpu-3-g2 tenant-1", plus its dry run | each change "REST", user `gpu-terraform`; the dry run is described |
+| Size | 354 lines of Python + a 133-line shared login library | 251 lines of Terraform code in 8 files + a 57-line setup script |
+| Needs | Python 3.9 or newer, nothing else | Terraform (123 MiB) + 4 providers (89 MiB) from the internet registry. An offline site needs a local mirror |
 
-¹ Measured with the earlier per-tenant pool addressing; the number of transactions does not depend on the addressing.
+The switch configuration is identical whichever tool set the label. The GPU behaves the same too: it doesn't know
+who made the change.
 
-The GPU side is the same under both tools, because the host agent does not know who made the change. A booked GPU
-is addressed within seconds and a moved one keeps its address. A released one drops its address within 5 s. The
-traffic matrices showed 0 violations after every test.
+## 5. Pros and cons
 
-## Pros and cons
-
-### EDA REST API (custom script)
+### REST API program
 
 **Pros**
 
-- Operator-friendly and immediate: one command per action, finished when the GPU works.
-- Atomic: one transaction for all GPUs of a command, after one dry run.
-- Safe with several operators without any state of its own: compare-and-swap on every port.
-- Clear audit trail: every transaction says what it did and to which GPUs.
-- Strictness per command: one miscabled GPU blocks only itself.
-- Light: Python only, works on an air-gapped jump host as it is, and is easy to call from a GPU scheduler or a
-  ticket workflow (meaningful exit codes).
+- **Fast and event-driven.** A change takes seconds and can be triggered by anything: a GPU scheduler, a self-service
+  portal, a ticket. That matches how GPUs are actually rented: per job, per tenant.
+- **Atomic.** Every command is one transaction: all its GPUs change, or none.
+- **Changes only the label.** It never takes over the port object, so nothing can delete a port by accident.
+- **Safe with several operators,** with no state file: compare-and-swap makes EDA refuse a change based on stale
+  information.
+- **Clear audit trail.** Every transaction in EDA says what was done to which GPU.
+- **All of EDA's safety features are available:** dry run, revert, merge requests (four-eyes, not used here) and a
+  least-privilege user.
+- **Light.** Needs only Python, works offline, and is easy to embed in any platform.
 
 **Cons**
 
-- Imperative: the intent is only in the commands run. Drift goes unnoticed until someone compares against the file.
-- Custom code to own: features such as retries, locking, a merge-request (four-eyes) mode, or a new EDA API version
-  are ours to build and maintain.
-- One gap in the compare-and-swap: two commits by the same EDA user in the same instant are bundled by EDA and both
-  pass. The script reports it afterwards, but cannot prevent it.
-- No review step enforced by the tool.
+- **You build and maintain it:**
+  - login and retries;
+  - reading the fabric, and the checks;
+  - error handling;
+  - every new feature, such as a merge-request mode, plus keeping up with new EDA API versions.
+- **The intent lives in the caller.** "Tenant 1 should have these 6 GPUs" is wherever the scheduler or the operator
+  keeps it. Nothing compares EDA against it unless you ask (`apply --dry-run`), so a change made in EDA's GUI goes
+  unnoticed.
+- **One gap in the safety net.** Two commits by the same EDA user in the very same instant are bundled together by
+  EDA, and both pass the compare-and-swap. The program detects this after the fact and reports it, but cannot
+  prevent it.
+- **No review step** unless you add one, such as EDA merge requests.
 
 ### Terraform
 
 **Pros**
 
-- Declarative and reviewable: the file is the intent, a pull request is the change request, and `plan` shows the
-  change with EDA's own dry-run verdict.
-- Drift detection built in: changes made in the GUI, by kubectl, by another tool or by an EDA revert show up in the
-  next plan and are reverted by the next apply.
-- Standard tooling with state and locking that fits CI/GitOps, using Nokia's own providers. The same tool can own the
-  tenants too: VRFs, frontends, isolation groups.
+- **The desired state is a file.** It is readable, versioned in git and reviewed in a pull request, and
+  `terraform plan` shows the exact change together with EDA's own dry-run verdict before anything happens.
+- **Drift is detected and corrected.** A label changed in the GUI, by another tool or by an EDA revert shows up in
+  the next plan, and the next apply puts the file's state back.
+- **Differences are computed for you.** Growing or shrinking a tenant changes only the GPUs that differ.
+- **A standard tool many teams already run in CI pipelines,** with state and locking. The same project can manage
+  the tenants themselves (networks, isolation groups, logins), not just the GPU bookings.
 
 **Cons**
 
-- Not atomic: Nokia's providers call each app's REST API, not EDA's Transaction API (EDA 26.8 docs, limitation 1).
-  Every port is its own transaction, an apply can stop half way, and the commits are labelled only "REST".
-- Noisy plans: one label change shows about 45 lines of "(known after apply)" around the one line that matters.
-- Needs careful wiring on objects it did not create:
-  - import blocks and `ignore_changes`;
-  - `prevent_destroy`, because a destroy would delete switch ports;
-  - plain REST calls for the dry run and the switch checks;
-  - a Keycloak login order;
-  - `label_selector`, not the deprecated `labelselector`, which EDA ignores.
-- Does not wait for the fabric; its checks only warn, on the next plan.
-- Strictness per file: one miscabled GPU anywhere blocks every change.
-- A state file to protect and share. Locking only works between people sharing that state, so a team needs a remote
-  backend.
-- Slower per change (plan + apply ≈ 10-11 s) and 212 MiB of binaries to install or mirror.
+- **Not atomic across ports.** With Nokia's typed resources every port is a separate transaction, so an apply can stop
+  half way. In EDA's history each change only says "REST".
+- **Hard to read.** One label change shows up in the plan surrounded by about 45 lines of "(known after apply)".
+- **Needs careful wiring** to manage objects that Terraform did not create. The ports must be adopted, Terraform must
+  be kept away from the rest of each port object, and deletion must be forbidden. Gaps in Nokia's providers on EDA
+  26.8.2 needed extra REST calls:
+  - no native dry run;
+  - the merge-request resource drops its contents;
+  - reverts fail for bundled transactions;
+  - an older label-filter setting is ignored (the newer `label_selector` works).
+- **Does not wait for the fabric.** Its after-checks only warn, and only on the next plan.
+- **Per-file strictness.** One miscabled GPU anywhere in the file blocks every change.
+- **A stale saved plan wins.** A label changed after `terraform plan -out` is silently overwritten by `apply`. Run
+  `terraform apply` without a saved plan, which plans again first, or keep the time between plan and apply short.
+- **A state file to protect and share.** Locking only helps operators who share that state, so a team needs a shared
+  remote backend.
+- **Heavier and slower.** A label change takes about 10.5 s instead of about 5 s. A full tenant onboarding takes
+  minutes. 212 MiB of software to install, or to mirror for an offline site.
 
-## When to use which
+## 6. Which one, when
 
-**GPU bookings are frequent, operational events**, usually triggered by a GPU scheduler or a self-service portal.
-They must be atomic, quick and proven. That is the REST API's ground, as a tool like `gpu-tenant.py` or the same
-logic inside the scheduler.
+- **Day-to-day GPU booking: the REST API.** Bookings come from a scheduler or portal, often and per job. They need to
+  be atomic, immediate and proven. Use a program like `gpu-tenant.py`, or the same logic inside the scheduler, with
+  a least-privilege EDA user.
+- **The tenant lifecycle: Terraform.** Onboarding a tenant, its quota and its removal change rarely and deserve
+  review, and that is where a desired-state file in git shines. It also suits a GPU allocation that changes rarely
+  and is reviewed, such as a quarterly contract.
+- **One owner per label.** Never let two tools manage the same `tenant` labels. If Terraform owns them, every booking
+  made another way is "drift" that the next `terraform apply` reverts.
+- **A possible next step (an idea, not built or tested here).** Model the booking itself as an EDA object, e.g. one
+  "GPU allocation" per tenant, handled by a small custom EDA application that sets the port labels. The GUI, the REST
+  API and Terraform would then all change that one object, and EDA would provide dry run, revert and merge requests
+  for bookings natively. The cost is building and maintaining that application.
 
-**Terraform fits a reviewed baseline that changes rarely**, such as a quarterly GPU allocation per tenant kept in
-git, where drift correction is the point. It is also the natural owner of the tenants themselves.
+## Not covered here
 
-Whichever you choose, **give the GPU labels one owner.** If Terraform owns them, every booking made by a script or
-in the GUI is drift that the next `terraform apply` reverts.
-
-## Found along the way (EDA 26.8.2)
-
-- **Compare-and-swap works.** A JSON patch `test` on `/metadata/labels` with a stale value makes EDA refuse the whole
-  transaction: HTTP 400 "test failed".
-- **EDA bundles transactions** posted by the same user at the same moment. A bundled transaction cannot be reverted
-  on its own.
-- **Concurrent logins fail.** EDA's Keycloak refuses concurrent password logins of the same user (HTTP 400), so
-  every client needs a retry.
-- **DHCP for the frontend does not work here.** EDA's `DHCPRelay` on the tenant gateways, with a DHCP server in the
-  route-leaked services network, fails: replies come back only through the leaf the server sits behind. So the
-  frontend keeps static addresses.
-- **A parked port withdraws the default router.** When the Backend parks a port, the GPU host loses its default
-  router but keeps its address, so a host agent must watch the router.
-
-## Not tested
-
-- a shared remote Terraform backend;
-- a merge-request (four-eyes) mode for either tool;
-- real GPU servers, whose LLDP names the server and the NIC rather than one VM per GPU;
-- macOS as the operator machine.
+- a shared Terraform state used by a team;
+- merge requests (four-eyes approval) for either tool;
+- real GPU servers, whose LLDP names the server and the card port;
+- DHCP for the frontend addresses: EDA's DHCP relay did not work across this frontend's route-leaked design, so the
+  frontend addresses stay static.
