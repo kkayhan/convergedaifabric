@@ -1,0 +1,27 @@
+# Which tenant owns which GPU: the desired state for BOTH tools.
+#   python3 automation/gpu-tenant.py apply automation/tenancy.yaml     (the script)
+#   cd automation/terraform && terraform plan && terraform apply        (Terraform)
+# One line per GPU: gpu-<server>-g<index>: tenant-1 | tenant-2 | free
+# GPU G of server gpu-<s> = its own NIC on rail G+1 (leaf l1-<G+1>). The tools find the switch port by LLDP and
+# refuse the change if EDA's inventory labels on that port disagree.
+# This file = the deploy-time booking (topology/gen-topology.py): tenant-1 6 GPUs, tenant-2 6, free 4.
+
+gpu-1-g0: tenant-1
+gpu-1-g1: tenant-1
+gpu-1-g2: tenant-1
+gpu-1-g3: tenant-1
+
+gpu-2-g0: tenant-1
+gpu-2-g1: tenant-1
+gpu-2-g2: tenant-2
+gpu-2-g3: tenant-2
+
+gpu-3-g0: tenant-2
+gpu-3-g1: tenant-2
+gpu-3-g2: free
+gpu-3-g3: free
+
+gpu-4-g0: tenant-2
+gpu-4-g1: tenant-2
+gpu-4-g2: free
+gpu-4-g3: free

@@ -31,6 +31,8 @@ log "delete NetworkTopologies in $NS via kubectl (also removes their workflow re
 log "  a stale record makes the next create of the same name a silent no-op)"
 $K -n "$NS" delete networktopologies.topologies.eda.nokia.com --all --ignore-not-found 2>/dev/null
 
+log "delete the gpu-terraform EDA user + the local Terraform state of automation/terraform (the ports go with the lab)"
+python3 "$HERE/automation/terraform/setup.py" remove || warn "Terraform user cleanup failed (continuing)"
 log "delete the gpu-orchestrator EDA user, group + Role (before the namespace holding the Role)"
 python3 "$HERE/orchestrator.py" remove || warn "orchestrator user cleanup failed (continuing)"
 

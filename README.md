@@ -21,6 +21,12 @@ EDA, not hardware.
   network (storage, management cluster, a shared CPU node), with four QoS classes on every port.
 - **An orchestrator with its own EDA identity.** `orchestrator.py` logs in as the EDA user `gpu-orchestrator`,
   which may change only Interface labels, and books, moves or releases GPUs in one EDA transaction each.
+- **GPU hosts that follow their port.** Every GPU VM runs a small host agent: when EDA books its port it takes the
+  tenant's /64 by SLAAC, on a move it swaps prefixes, on a release it drops the address. Nothing runs on the host
+  for a booking.
+- **Two ways to automate bookings, compared.** `automation/` holds a script on EDA's REST API and a Terraform project
+  on Nokia's EDA providers, both checking each GPU's switch port by LLDP against EDA's inventory before changing
+  anything. `automation/COMPARISON.md` has the measurements and the pros and cons of each.
 - **Live views.** A traffic matrix that pings every GPU from every GPU and flags any leak between tenants, and a
   Grafana topology with live traffic per cable direction and every GPU coloured by its tenant.
 
@@ -49,6 +55,8 @@ EDA, not hardware.
 
 - bash 4 or newer, `kubectl`, and python3 3.9 or newer (standard library only).
 - `jq` and `sshpass`, for `aifabric-ssh`.
+- Optional: Terraform 1.9 or newer, for `automation/terraform/` (it downloads Nokia's EDA providers from the
+  Terraform registry).
 
 ## Deploy
 
@@ -108,7 +116,8 @@ all. `topology` deletes and rebuilds the lab.
   - the frontend VirtualNetworks;
   - the dashboard's Prometheus and Grafana.
 - **Outside the namespace:**
-  - EDA user and group `gpu-orchestrator`, with Role `aifabric:gpu-orchestrator`;
+  - EDA user and group `gpu-orchestrator`, with Role `aifabric:gpu-orchestrator` (plus user `gpu-terraform` in the
+    same group once you run `automation/terraform/setup.py`);
   - in `eda-system`: HttpProxy `aifabric-grafana`, four `Export` objects `aifabric-*`, and TopologyGrouping
     `aifabric-spine-leaf`. The grouping makes EDA's topology page open on spine/leaf tiers, for every namespace.
   - the Prometheus Exporter app, only if it was missing.
@@ -134,7 +143,9 @@ All tools use the connection saved by `./deploy.sh`.
 | `python3 orchestrator.py book tenant-1 gpu-3-g2 gpu-3-g3` | Books GPUs for a tenant: one dry-run, then one EDA transaction as user `gpu-orchestrator`. Then it re-addresses the GPU VMs. A GPU of the other tenant moves, a free one leaves the pool. |
 | `python3 orchestrator.py release gpu-3-g2 gpu-3-g3` | Sends GPUs back to the free pool. |
 | `python3 orchestrator.py baseline` | Back to the deploy-time booking: tenant-1 6 GPUs, tenant-2 6, free 4. |
-| `bash hosts.sh --follow` | Re-addresses a GPU VM whenever its `tenant` label changes. Use it when you relabel ports by hand or in the EDA UI. |
+| `python3 automation/gpu-tenant.py assign tenant-1 gpu-3-g2` | The automation script: books, moves (`--move`), releases (`unassign`) or applies `automation/tenancy.yaml`, after checking the GPU's port by LLDP; one dry run + one transaction, done when the GPU's NIC has its address. `list` shows every GPU. See `automation/README.md`. |
+| `cd automation/terraform && python3 setup.py && terraform apply` | The same bookings as Terraform: edit `automation/tenancy.yaml`, plan (EDA dry run), apply. See `automation/README.md`. |
+| `bash hosts.sh --follow` | Sets a GPU VM's frontend VLAN 2 address whenever its `tenant` label changes (VLAN 1 follows by itself: host agent). Keep it running when you book GPUs by any means. |
 | `./aifabric-ssh` | Node access. `-l` lists every node with its role and live tenant; `l1-1` opens the SR Linux CLI (admin / NokiaSrl1!); `gpu-1-g0` opens a shell in a GPU VM. `-c 'CMD' NODE`, `--stripe gpu1`, `--tenant 2`, `--all-switch` run commands on one node or a group. |
 | `python3 fail-spine.py l2-1 down` / `up` | Takes a spine out (one transaction disables its 42 ISLs) and brings it back. Cross-rail traffic moves to the other spine. |
 | `python3 qos-path.py frontend 48` | Sends traffic of one QoS class and shows which queue it used on every hop (also `frontend 10`, `frontend 0`, `rdma 26`). |

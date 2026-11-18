@@ -1,3 +1,9 @@
 # per-machine state written by deploy.sh: the saved connection (no password), the kubectl wrapper, deploy logs
 .state/
 __pycache__/
+# Terraform (automation/terraform): provider cache, state, the generated variables (client secret), saved plans
+automation/terraform/.terraform/
+automation/terraform/*.tfstate
+automation/terraform/*.tfstate.*
+automation/terraform/terraform.tfvars
+automation/terraform/*.tfplan

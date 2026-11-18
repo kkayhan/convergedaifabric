@@ -26,7 +26,9 @@ HN_RA_METRIC=512                                               # GPU NIC's RA de
 hn_lldp() {
   hostname "$1" 2>/dev/null || true
   pgrep -x lldpd >/dev/null || lldpd -I "eth[1-9]*" >/dev/null 2>&1
-  sleep 1; lldpcli configure lldp portidsubtype ifname >/dev/null 2>&1; true
+  sleep 1; lldpcli configure lldp portidsubtype ifname >/dev/null 2>&1
+  # the LLDP system name = this host, even if an override was configured in lldpd (e.g. a miscabling test)
+  lldpcli configure system hostname "$1" >/dev/null 2>&1; lldpcli update >/dev/null 2>&1; true
 }
 
 hn_slaac() {  # <parent>: VLAN 1 subinterface that takes the leaf's router advertisements, host part from the MAC
@@ -84,16 +86,19 @@ hn_backend() {
   ip -6 -o addr show dev "$1.1" scope global to "$2::/64" | grep -q . && chk="in the /64 EDA allocated" \
     || chk="!! EDA allocated $2::/64"
   echo "    backend  $1.1  $a  gw $gw  (VLAN 1, SLAAC, host part from the MAC; $chk)"
+  hn_v4_example "$1" "${3:-}" "${4:-}"
+}
+
+hn_v4_example() {  # <parent> [<v4/31> <gw>]: IPv4 on VLAN 1 only where an example gpu-ipv4 Configlet sits; else none
   for a in $(ip -4 -o addr show dev "$1.1" | awk '{print $4}'); do
-    [ "$a" = "${3:-}" ] || ip -4 addr del "$a" dev "$1.1"
+    [ "$a" = "${2:-}" ] || ip -4 addr del "$a" dev "$1.1"
   done
-  if [ -n "${3:-}" ]; then
-    ip -4 addr replace "$3" dev "$1.1"
-    ip route replace 10.201.0.0/16 via "$4" dev "$1.1"
-    echo "    backend  $1.1  $3  gw $4  (VLAN 1 IPv4, gpu-ipv4 Configlet)"
+  if [ -n "${2:-}" ]; then
+    ip -4 addr replace "$2" dev "$1.1"
+    ip route replace 10.201.0.0/16 via "$3" dev "$1.1"
+    echo "    backend  $1.1  $2  gw $3  (VLAN 1 IPv4, gpu-ipv4 Configlet)"
   else
     ip route del 10.201.0.0/16 dev "$1.1" 2>/dev/null
-    echo "    backend  $1.1  IPv6 only (no example gpu-ipv4 Configlet on this port)"
   fi
 }
 
@@ -115,6 +120,11 @@ hn_frontend() {  # <dev> <parent> <cidr> <gw>
   ip route replace 10.20.0.0/14 via "$gw" dev "$dev"
   arping -q -U -c 1 -I "$dev" "${want%/*}" >/dev/null 2>&1 || true
   echo "    frontend $dev  $want  gw $gw  (VLAN 2)"
+  hn_qos "$dev"
+}
+
+hn_qos() {  # <dev>: the host's QoS marking on its VLAN 2 device (address-independent: matches the device only)
+  dev=$1
   command -v nft >/dev/null 2>&1 || apk add --no-cache nftables >/dev/null 2>&1
   nft -f - <<NFT || { echo "    frontend QoS marking FAILED on $dev"; return 1; }
 table inet aifabric_qos

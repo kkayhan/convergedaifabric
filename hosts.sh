@@ -6,13 +6,14 @@
 # GPU VMs gpu-<s>-g<G> (PER-GPU TENANCY, owner 2026-10-26): one sim per GPU, ONE NIC eth1 = the GPU's
 #   ConnectX-8 on rail G+1 (leaf l1-<G+1>). Tenant = the `tenant` label of that NIC's Interface in EDA;
 #   no label = free (unbooked).
-#   booked: VLAN 1 eth1.1 by SLAAC (owner 2026-11-03): the leaf's router advertisement carries the /64 the
-#           Backend took from the tenant's pool (manifests/backend.yaml) + the default route; host part = EUI-64
-#           from the NIC's MAC (owner Q1 B). The /64 is also read from EDA, only to wait for the booking and check
-#           the result; + IPv4 = the leaf's /31 + 1 when the port carries one of the example gpu-ipv4 Configlets
-#           (read from EDA too; owner 2026-11-02), route 10.201.0.0/16 via the leaf;
-#           VLAN 2 eth1.2 = node address in the tenant's frontend subnet.
-#   free:   both parked (no address): the Backend renders nothing on an unlabelled GPU port (no RA either).
+#   VLAN 1 eth1.1 = the VM's own HOST AGENT (host-agent.sh, owner R2-Q2 2026-11-18), armed here once: SLAAC from the
+#           leaf's router advertisement (the /64 the Backend took from the tenant's pool, host part = EUI-64 of the
+#           NIC's MAC), and it follows bookings, moves and releases BY ITSELF (no script in the booking path). This
+#           script only checks the result against EDA's /64; + IPv4 = the leaf's /31 + 1 when the port carries one of
+#           the example gpu-ipv4 Configlets (owner 2026-11-02), route 10.201.0.0/16 via the leaf.
+#   VLAN 2 eth1.2 = static node address in the tenant's frontend subnet, set here (DHCP over the route-leaked
+#           frontend does not work, eda-lab § HOST SLAAC) ⇒ `--follow` re-runs this on a label change.
+#   free:   VLAN 1 parked by the agent (the Backend renders nothing on an unlabelled GPU port), VLAN 2 parked here.
 # Storage-island hosts: 802.3ad bond0 over eth1 (l1-5) + eth2 (l1-6) = partner of the all-active
 #   ESI-LAG lag-<host>-local; VLAN 2 on bond0.2.
 # FRONTEND VLAN 2 (manifests/frontend.yaml; only when it is deployed): subnet = the host's CURRENT tenant
@@ -24,8 +25,8 @@
 # ces-1 also runs iperf3 servers on ports 5301-5316 = "model weights" for the inference job (k8s/inference.sh).
 # Every server: hostname = sim name + lldpd, so the leaves' LLDP table names it.
 #   bash hosts.sh [server ...]     default: all (a GPU server name = its 4 GPU VMs)
-#   bash hosts.sh --follow         keep running: when a GPU's `tenant` label changes (by hand, in the EDA UI or
-#                                  with kubectl), re-address that GPU VM. Stand-in for the host provisioning the
+#   bash hosts.sh --follow         keep running: when a GPU's `tenant` label changes (by hand, in the EDA UI, with
+#                                  kubectl, gpu-tenant.py or Terraform), set that VM's frontend VLAN 2 (VLAN 1 = agent). Stand-in for the host provisioning the
 #                                  in-cluster orchestrator does when the Kubernetes layer is up (owner Q2 A 2026-10-27).
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -69,6 +70,12 @@ want(){ [ "$ONLY" = "  " ] || [[ "$ONLY" == *" $1 "* ]]; }
 
 sim_run(){  # sim_run <server> <calls>: host-net.sh + calls on stdin
   { cat "$HERE/host-net.sh"; echo "$2"; } | $K -n eda-system exec -i "deploy/cx-${NS}--$1-sim" -c "$1" -- sh -s
+}
+
+install_agent(){  # install_agent <gpu vm>: host-net.sh + host-agent.sh into /etc/aifabric (the agent re-sources them)
+  { echo "mkdir -p /etc/aifabric"
+    for f in host-net.sh host-agent.sh; do echo "cat > /etc/aifabric/$f <<'AIFABRIC_EOF'"; cat "$HERE/$f"; echo AIFABRIC_EOF; done
+  } | $K -n eda-system exec -i "deploy/cx-${NS}--$1-sim" -c "$1" -- sh -s
 }
 
 wait_ports(){  # wait_ports <server> <n>: cxdp plugs ethN ~60 s after the pod is Running
@@ -122,19 +129,23 @@ for entry in $GPU_SERVERS; do
     OCTET[$vm]=$(( ${s#gpu-} * 10 + g ))
     echo "--> $vm (GPU$g of $s, eth1 -> l1-$r ethernet-1/$port/$ch, tenant ${t:-free})"
     wait_ports "$vm" 1 || { echo "    $vm: pod or eth1 not ready"; rc=1; continue; }
+    # VLAN 1 = the VM's own host agent (host-agent.sh, owner R2-Q2 2026-11-18): it follows what the leaf advertises,
+    # so a booking needs nothing here; this run only (re)arms it and checks it against EDA's /64.
+    want_pfx=-
+    v4call="hn_v4_example eth1"
     if [ -n "$t" ]; then
-      p=$(awk -v l="l1-$r" -v i="ethernet-1/$port/$ch" '$1==l && $2==i {print $3}' <<<"$PFX")
-      [ -n "$p" ] || { echo "    $vm: tenant-$t but no prefix on l1-$r ethernet-1/$port/$ch yet"; rc=1; continue; }
+      want_pfx=$(awk -v l="l1-$r" -v i="ethernet-1/$port/$ch" '$1==l && $2==i {print $3}' <<<"$PFX")
+      [ -n "$want_pfx" ] || { echo "    $vm: tenant-$t but no prefix on l1-$r ethernet-1/$port/$ch yet"; rc=1; continue; }
       v4=$(awk -v l="l1-$r" -v i="ethernet-1/$port/$ch" '$1==l && $2==i {print $3}' <<<"$PFX4")
-      calls="hn_backend eth1 $p"
       if [ -n "$v4" ]; then            # leaf 10.201.r.2k/31 => GPU 10.201.r.2k+1/31, gw = the leaf
-        gw=${v4%/*}; calls="$calls ${gw%.*}.$(( ${gw##*.} + 1 ))/31 $gw"
+        gw=${v4%/*}; v4call="$v4call ${gw%.*}.$(( ${gw##*.} + 1 ))/31 $gw"
       fi
-    else
-      calls="hn_backend_park eth1"
     fi
-    sim_run "$vm" "hn_lldp $vm
-$calls
+    install_agent "$vm" || { echo "    $vm: could not install the host agent"; rc=1; continue; }
+    sim_run "$vm" ". /etc/aifabric/host-agent.sh
+hn_arm eth1 $vm
+hn_state eth1 $want_pfx
+$v4call
 $(fe_call "$vm" eth1.2 eth1 "$t")" || rc=1
   done
 done
