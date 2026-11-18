@@ -2,14 +2,14 @@
 """gpu-tenant.py: give GPUs to tenants on the aifabric fabric through the EDA REST API.
 
 A GPU belongs to a tenant through ONE label on its switch port (the EDA Interface): tenant=<N>. The aifabrics
-Backend then puts the port into the tenant's VRF (VLAN 1, a /64 from the tenant's pool), and the frontend VLAN 2
+Backend then puts the port into the tenant's VRF (VLAN 1; the port's own fixed /64, gateway <prefix>::1), and the frontend VLAN 2
 follows the same label. No label = a free GPU: its port carries nothing.
 
 WHICH PORT a GPU is on comes from the switches, not only from EDA's inventory. LLDP on the leaf port names the host
 behind it (the GPU's NIC), and EDA's topology labels on that port (gpu-server, rail) must say the same. If they
 disagree, or the port has no LLDP neighbour, the whole change is refused (strict: owner decision R2-Q1 B,
 2026-11-18). After a booking the leaf's IPv6 neighbour table proves it: the NIC with the LLDP MAC took an address
-from the tenant's /64 (SLAAC).
+from the port's /64 (SLAAC) and answers in the tenant's VRF.
 
   gpu-tenant.py list                               every GPU: port, LLDP check, tenant, VRF, address
   gpu-tenant.py assign tenant-1 gpu-3-g2 gpu-4     book GPUs (gpu-<s>-g<G>, or gpu-<s> = all its GPUs)
@@ -325,7 +325,7 @@ def execute(f: Fabric, todo: list[tuple[str, Port, str | None]], verb: str, args
         time.sleep(0.5)
     print(f"  switches done  ({time.monotonic() - t0:.1f} s): "
           + ", ".join(f"{g} {got[g] or 'parked'}" for g in want))
-    # the GPU NICs: SLAAC address from the tenant's /64, learned by the leaf from the NIC LLDP reported
+    # the GPU NICs: SLAAC address from the port's /64, learned by the leaf (in the tenant's VRF) from the NIC LLDP reported
     def labels_now() -> dict[str, str | None]:
         return {i["metadata"]["name"]: (i["metadata"].get("labels") or {}).get("tenant")
                 for i in f.api.call("GET", f"/apps/interfaces.eda.nokia.com/v1/namespaces/{NS}/interfaces?"

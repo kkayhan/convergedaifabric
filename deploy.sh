@@ -136,7 +136,7 @@ phase_frontend(){
 }
 
 phase_hosts(){
-  log "PHASE hosts — GPU VMs (booked: VLAN 1 IPv6 by SLAAC, /64 from the tenant's pool + IPv4 where an example Configlet sits + VLAN 2; free: parked) + storage-island bonds + frontend VLAN 2 (if deployed)"
+  log "PHASE hosts — GPU VMs (host agent: VLAN 1 IPv6 by SLAAC from the port's fixed /64 + IPv4 where an example Configlet sits; VLAN 2 static; free: parked) + storage-island bonds + frontend VLAN 2 (if deployed)"
   KUBECTL="$K" bash "$HERE/hosts.sh"
 }
 

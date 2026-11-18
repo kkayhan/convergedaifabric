@@ -14,19 +14,21 @@ EDA, not hardware.
 - **Tenants book GPUs, not servers.** Four GPU servers with four GPUs each; every GPU has its own NIC on its own
   rail and runs as its own VM `gpu-<s>-g<G>`. A GPU belongs to a tenant through one label on its switch
   port (`tenant=1|2`); a GPU without the label is free and its port carries nothing.
-- **Addresses without DHCP.** Each tenant has its own IPv6 pool (`fd00:1::/48`, `fd00:2::/48`). EDA gives every
-  booked GPU port the next free /64 of its tenant's pool, the leaf advertises it, and the GPU NIC builds its
-  own address from it (SLAAC, host part from the NIC's MAC).
+- **Addresses without DHCP, gateways you can predict.** EDA gives every booked GPU port its own /64, computed from
+  the stripe, the leaf and the port (no pool to manage): `fd00:100:<leaf>01:<port>0<channel>::/64`. The leaf is `::1`
+  of it and advertises it, and the GPU NIC builds its own address from it (SLAAC, host part from the NIC's MAC). So
+  every GPU's gateway is fixed: the same after a release and a new booking, and when it moves to the other tenant
+  (the VRF changes, the address does not). Table below, under "GPU gateways".
 - **A converged NIC.** VLAN 1 carries RDMA, VLAN 2 the frontend: per-tenant frontend VRFs plus a shared services
   network (storage, management cluster, a shared CPU node), with four QoS classes on every port.
 - **An orchestrator with its own EDA identity.** `orchestrator.py` logs in as the EDA user `gpu-orchestrator`,
   which may change only Interface labels, and books, moves or releases GPUs in one EDA transaction each.
 - **GPU hosts that follow their port.** Every GPU VM runs a small host agent: when EDA books its port it takes the
-  tenant's /64 by SLAAC, on a move it swaps prefixes, on a release it drops the address. Nothing runs on the host
+  port's /64 by SLAAC, on a move to the other tenant it keeps it, on a release it drops it. Nothing runs on the host
   for a booking.
 - **Two ways to automate bookings, compared.** `automation/` holds a script on EDA's REST API and a Terraform project
   on Nokia's EDA providers, both checking each GPU's switch port by LLDP against EDA's inventory before changing
-  anything. `automation/COMPARISON.md` has the measurements and the pros and cons of each.
+  anything. `TERRAFORM-VS-REST-API.md` explains both, how each works, the measurements and the pros and cons.
 - **Live views.** A traffic matrix that pings every GPU from every GPU and flags any leak between tenants, and a
   Grafana topology with live traffic per cable direction and every GPU coloured by its tenant.
 
@@ -131,6 +133,32 @@ all. `topology` deletes and rebuilds the lab.
 This deletes everything listed above except the Prometheus Exporter app, which others may use. It takes about a
 minute. It may show one or two FAILED transactions in the EDA UI; that is harmless, because EDA retries the
 deletes in the right order by itself.
+
+## GPU gateways
+
+Every GPU has its own NIC on its own rail leaf, and EDA (Backend `addressAllocation: EDAManagedIPv6`) gives that port a
+fixed /64: `fd00:<stripe ID>00:<leaf index>01:<port>0<channel>::/64`, here stripe gpu1 = 1 and leaf index = rail.
+The leaf holds `::1`, the GPU's gateway; the GPU's own address is that /64 plus a host part from its MAC (SLAAC).
+The /64 exists on the switch only while the GPU is booked, but it is always the same one. Measured on all 16 ports.
+
+| GPU | What | Leaf port | /64 | Gateway |
+|---|---|---|---|---|
+| `gpu-1-g0` | GPU0 of server gpu-1 | `l1-1` `ethernet-1/1/1` | `fd00:100:101:101::/64` | `fd00:100:101:101::1` |
+| `gpu-1-g1` | GPU1 of server gpu-1 | `l1-2` `ethernet-1/1/1` | `fd00:100:201:101::/64` | `fd00:100:201:101::1` |
+| `gpu-1-g2` | GPU2 of server gpu-1 | `l1-3` `ethernet-1/1/1` | `fd00:100:301:101::/64` | `fd00:100:301:101::1` |
+| `gpu-1-g3` | GPU3 of server gpu-1 | `l1-4` `ethernet-1/1/1` | `fd00:100:401:101::/64` | `fd00:100:401:101::1` |
+| `gpu-2-g0` | GPU0 of server gpu-2 | `l1-1` `ethernet-1/1/2` | `fd00:100:101:102::/64` | `fd00:100:101:102::1` |
+| `gpu-2-g1` | GPU1 of server gpu-2 | `l1-2` `ethernet-1/1/2` | `fd00:100:201:102::/64` | `fd00:100:201:102::1` |
+| `gpu-2-g2` | GPU2 of server gpu-2 | `l1-3` `ethernet-1/1/2` | `fd00:100:301:102::/64` | `fd00:100:301:102::1` |
+| `gpu-2-g3` | GPU3 of server gpu-2 | `l1-4` `ethernet-1/1/2` | `fd00:100:401:102::/64` | `fd00:100:401:102::1` |
+| `gpu-3-g0` | GPU0 of server gpu-3 | `l1-1` `ethernet-1/2/1` | `fd00:100:101:201::/64` | `fd00:100:101:201::1` |
+| `gpu-3-g1` | GPU1 of server gpu-3 | `l1-2` `ethernet-1/2/1` | `fd00:100:201:201::/64` | `fd00:100:201:201::1` |
+| `gpu-3-g2` | GPU2 of server gpu-3 | `l1-3` `ethernet-1/2/1` | `fd00:100:301:201::/64` | `fd00:100:301:201::1` |
+| `gpu-3-g3` | GPU3 of server gpu-3 | `l1-4` `ethernet-1/2/1` | `fd00:100:401:201::/64` | `fd00:100:401:201::1` |
+| `gpu-4-g0` | GPU0 of server gpu-4 | `l1-1` `ethernet-1/2/2` | `fd00:100:101:202::/64` | `fd00:100:101:202::1` |
+| `gpu-4-g1` | GPU1 of server gpu-4 | `l1-2` `ethernet-1/2/2` | `fd00:100:201:202::/64` | `fd00:100:201:202::1` |
+| `gpu-4-g2` | GPU2 of server gpu-4 | `l1-3` `ethernet-1/2/2` | `fd00:100:301:202::/64` | `fd00:100:301:202::1` |
+| `gpu-4-g3` | GPU3 of server gpu-4 | `l1-4` `ethernet-1/2/2` | `fd00:100:401:202::/64` | `fd00:100:401:202::1` |
 
 ## Demo tools
 

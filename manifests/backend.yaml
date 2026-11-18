@@ -30,34 +30,15 @@
 #                    on any switch (txn 1023, 0 probes lost). To bring it back (SR Linux with DLB for VXLAN):
 #                      dynamicLoadBalancing: { mode: Dynamic, flowsetSize: 256, inactivityTimerUs: 50, samplingIntervalUs: 5 }
 #   rocev2QoS        lossless RoCEv2: ECN slope + PFC with deadlock detection.
-#   addressing       PerTenantIPv6Pool (owner 2026-11-03: "use pertenantipv6 subnet with /64 prefix length, and use
-#                    SLAAC if possible"): each tenant has its own SubnetAllocationPool below, and every GPU port the
-#                    tenant books gets the next free /64 of it (leaf = ::1, router advertisement with that /64), so
-#                    the address names the tenant: tenant-1 = fd00:1::/48, tenant-2 = fd00:2::/48 (mnemonic of the
-#                    frontend's 10.2<T>.0.0/24). The GPU configures itself by SLAAC (host-net.sh: router
-#                    solicitation, fixed host part ::2 by `ip token`). Moving a GPU to the other tenant = a /64 from
-#                    the other pool. A pool must hold one /64 per GPU the tenant may book: one /64 short fails the
-#                    WHOLE Backend transaction ("pool … is exhausted", dry-run 1393). Until 2026-11-03:
-#                    EDAManagedIPv6 (/64 computed from stripe, leaf, port: fd00:100:<leaf>01:<P>0<C>::/64).
-# The pools come first: the Backend refuses a pool that does not exist (dry-run 1395).
-apiVersion: core.eda.nokia.com/v1
-kind: SubnetAllocationPool
-metadata:
-  name: gpu-tenant-1-v6
-  namespace: aifabric
-spec:
-  segments:
-    - { subnet: "fd00:1::/48", subnetLength: 64 }
----
-apiVersion: core.eda.nokia.com/v1
-kind: SubnetAllocationPool
-metadata:
-  name: gpu-tenant-2-v6
-  namespace: aifabric
-spec:
-  segments:
-    - { subnet: "fd00:2::/48", subnetLength: 64 }
----
+#   addressing       EDAManagedIPv6, /64 per GPU port (owner 2026-11-18: "make EDAManagedIPv6 for the address allocation.
+#                    this way, IPv6 GW for each GPU will be deterministic"; PerTenantIPv6Pool 2026-11-03 → 11-18 is
+#                    in git history). EDA computes each GPU port's /64 from the stripe, the leaf and the port, no pool:
+#                      fd00:<stripeID>00:<leaf index>01:<port>0<channel>::/64, leaf (= the GPU's gateway) ::1
+#                    e.g. gpu-1-g0 on l1-1 ethernet-1/1/1 = fd00:100:101:101::/64, gateway fd00:100:101:101::1.
+#                    The /64 belongs to the PORT: it stays the same when the GPU is released and booked again and when
+#                    it moves to the other tenant (the VRF changes, the address does not). The leaf advertises it, the
+#                    GPU NIC configures itself by SLAAC (host part = EUI-64 of its MAC; host-agent.sh).
+#                    leaf index = EDA's leafindex-pool, Global scope = one per namespace, only leaves with GPU ports.
 apiVersion: aifabrics.eda.nokia.com/v1
 kind: Backend
 metadata:
@@ -70,7 +51,10 @@ spec:
   systemPoolIPv4: systemipv4-pool
   ipMTU: 4200
   addressAllocation:
-    type: PerTenantIPv6Pool
+    type: EDAManagedIPv6
+    edaManagedIPv6:
+      leafIndexPoolScope: Global
+      prefixLength: "64"
   stripes:
     - { name: gpu1, stripeID: 1, gpuVLAN: 1, nodeSelectors: [ stripe=gpu1 ] }
     - { name: non-gpu, stripeID: 2, gpuVLAN: 1, nodeSelectors: [ stripe=non-gpu ] }
@@ -80,8 +64,8 @@ spec:
     linkSelectors: [ role=interSwitch ]
   # list = OR; "a=b,c=d" in ONE string = AND
   gpuIsolationGroups:
-    - { name: tenant-1, interfaceSelectors: [ "role=gpu,tenant=1" ], ipv6Pool: { name: gpu-tenant-1-v6 } }
-    - { name: tenant-2, interfaceSelectors: [ "role=gpu,tenant=2" ], ipv6Pool: { name: gpu-tenant-2-v6 } }
+    - { name: tenant-1, interfaceSelectors: [ "role=gpu,tenant=1" ] }
+    - { name: tenant-2, interfaceSelectors: [ "role=gpu,tenant=2" ] }
   rocev2QoS:
     ecnSlopeMinThresholdPercent: 5
     ecnSlopeMaxThresholdPercent: 80

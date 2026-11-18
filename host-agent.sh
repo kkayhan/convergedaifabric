@@ -7,11 +7,14 @@
 #   hn_arm <parent> <name>      once per VM (deploy phase hosts, or after a pod restart = power-on provisioning):
 #                               hostname + LLDP, VLAN 1 SLAAC armed, the agent (re)started. Idempotent, hitless.
 #   hn_agent <parent>           the loop (detached; log /var/log/aifabric-agent.log), every second:
-#     booked    a SLAAC address appears (the Backend put the port in a tenant VRF, the leaf advertised the /64)
-#               => ping the leaf ::1 once (its IPv6 neighbour table learns the NIC: proof for the tools)
-#     moved     a second /64 appears (tenant move: the leaf advertises the other tenant's /64 and never withdraws
-#               the old one) => forget both, solicit => only the new one comes back (= a re-provisioned host)
-#     released  the leaf's gateway stops answering for 3 s (the Backend parked the port) => forget the address
+#     booked    a SLAAC address appears (the Backend put the port in a tenant VRF, the leaf advertised the port's
+#               /64; EDAManagedIPv6 since 2026-11-18 = a fixed /64 per port, the leaf = <prefix>::1)
+#     every s   ping the leaf's <prefix>::1 from the NIC's address: proves the port still carries the GPU AND keeps
+#               the leaf's IPv6 neighbour entry fresh (a tenant move keeps the /64 but changes the VRF, and the leaf
+#               must learn the NIC again there: proof for the tools)
+#     moved     a second /64 appears (only when the allocation scheme itself changes: the leaf advertises the new
+#               prefix and never withdraws the old one) => forget both, solicit => only the new one comes back
+#     released  no default router, or the leaf's ::1 silent for 3 s (the Backend parked the port) => forget it
 #     parked    no address => router solicitation every 10 s (a booking is picked up even if its RA was missed)
 #   hn_state <parent> [<prefix>]  print what VLAN 1 holds; with <prefix> (EDA's /64 for a booked port) wait up to
 #                                 20 s for exactly one address inside it; with "-" wait for no address
@@ -37,13 +40,12 @@ hn_agent() {  # <parent>
     if [ "$n" -eq 1 ] && [ -n "$pfx" ]; then
       idle=0
       gw=$(ip -6 route show default dev "$dev" 2>/dev/null | awk '{print $3; exit}')
-      # booked = an address AND a leaf that answers as default router. When the Backend parks the port the leaf
-      # withdraws as router (the default route goes, the address stays: measured 2026-11-18) or stops answering
-      if [ -n "$gw" ] && ping -c 1 -W 1 -I "$dev" "$gw" >/dev/null 2>&1; then
+      # booked = an address AND a default router AND the leaf's ::1 answering. When the Backend parks the port the
+      # leaf withdraws as router (the default route goes, the address stays: measured 2026-11-18) and stops answering
+      if [ -n "$gw" ] && ping -c 1 -W 1 -I "$dev" "${pfx%/64}1" >/dev/null 2>&1; then
         fails=0
         if [ "$pfx" != "$last" ]; then
-          hn_log "booked: $(ip -6 -o addr show dev "$dev" scope global | awk '{print $4; exit}') (gateway $gw)"
-          ping -c 2 -W 1 "${pfx%/64}1" >/dev/null 2>&1        # the leaf's ::1 learns the NIC (neighbour table)
+          hn_log "booked: $(ip -6 -o addr show dev "$dev" scope global | awk '{print $4; exit}') (gateway ${pfx%/64}1, router $gw)"
           last=$pfx
         fi
       else

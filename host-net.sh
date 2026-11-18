@@ -66,7 +66,7 @@ hn_backend() {
      [ "$(ip -6 -o addr show dev "$1.1" scope global to "$2::/64" | wc -l)" -ne 1 ] ||        # not in EDA's /64
      [ "$(ip -6 route show dev "$1.1" | awk '$1 !~ /^fe80/ && $1 != "default" {print $1}')" != "$2::/64" ] ||
      ! ip -6 route show default dev "$1.1" | grep -q " metric $HN_RA_METRIC "; then             # RA default, old metric
-    # A new booking or a tenant move (/64 from the other tenant's pool): forget the old addresses + routes, then
+    # A new booking or a prefix change (allocation scheme changed): forget the old addresses + routes, then
     # link up = router solicitation => the leaf answers at once (unsolicited RAs: every 200-600 s, plus one when the
     # port's prefix changes). 2.6-3.3 s incl. DAD (measured 2026-11-03 on gpu-4-g1). Unchanged booking = nothing
     # touched (hitless re-run).

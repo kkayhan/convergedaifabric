@@ -2,9 +2,9 @@
 # create a few CRs that serves as an example. that's it"; "this is to showcase what it needs to be configured on
 # EDA manually if SLAAC is not used").
 #
-# What the Backend does by itself (addressAllocation, here PerTenantIPv6Pool, cannot be switched off): every booked
-# GPU port gets a /64 from its tenant's pool, the leaf ::1 and a router advertisement, so the host configures
-# itself (SLAAC, as these GPUs do since 2026-11-03).
+# What the Backend does by itself (addressAllocation, here EDAManagedIPv6, cannot be switched off): every booked
+# GPU port gets its own fixed /64 (fd00:100:<leaf>01:<port>0<channel>::/64), the leaf ::1 (= the GPU's gateway) and a
+# router advertisement, so the host configures itself (SLAAC, as these GPUs do since 2026-11-03).
 # It has no IPv4 option at all. For IPv4 an operator writes, PER GPU PORT, one Configlet like the three below:
 # the leaf side of a /31 on the Backend's own VLAN 1 subinterface (.1, already in the tenant's VRF, which carries
 # it to the tenant's other leaves over EVPN). The GPU side (the other half of the /31, gateway = the leaf) is
@@ -23,7 +23,7 @@
 # CAVEATS (measured 2026-11-02): such a Configlet only works while its GPU is booked (a parked port has no
 # subinterface: the Configlet fails), and while it exists the GPU cannot be released ("cannot delete as there are
 # children present") => delete the Configlet before releasing that GPU. A tenant move keeps it (the IPv4 belongs
-# to the port; the IPv6 /64 comes from the new tenant's pool). Delete Configlets before the Backend (deploy.sh topology, destroy.sh do).
+# to the port, and so does the IPv6 /64). Delete Configlets before the Backend (deploy.sh topology, destroy.sh do).
 # gpu-1-g0 (tenant-1): leaf 10.201.1.0/31 <-> GPU 10.201.1.1/31
 apiVersion: config.eda.nokia.com/v1
 kind: Configlet

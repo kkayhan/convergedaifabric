@@ -47,7 +47,7 @@ RDMA = {  # gpu-1-g0 rail 1 (l1-1 e1-1/1/1) <-> gpu-2-g1 rail 2 (l1-2 e1-1/1/2),
 }
 
 
-def backend_v6(vm):                          # the GPU NIC's SLAAC address (tenant pool /64 + MAC part), read on the host
+def backend_v6(vm):                          # the GPU NIC's SLAAC address (the port's /64 + MAC part), read on the host
     out = subprocess.run([SSH, "-c", "ip -6 -o addr show dev eth1.1 scope global", vm], capture_output=True, text=True).stdout
     for w in out.split():
         if "/" in w and ":" in w:

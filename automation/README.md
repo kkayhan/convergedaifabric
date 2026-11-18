@@ -1,13 +1,13 @@
 # Automating GPU bookings: a script and Terraform
 
 Two ways to give GPUs to tenants on this fabric, built side by side. Both change one thing: the `tenant` label on
-each GPU's switch port (EDA Interface). `COMPARISON.md` has the measurements and the pros and cons of each.
+each GPU's switch port (EDA Interface). `../TERRAFORM-VS-REST-API.md` explains both approaches, how each works, the measurements and the pros and cons.
 
 Both find a GPU's port from the switches (LLDP) and refuse any change when EDA's inventory labels on that port
 disagree, which catches crossed cables and wrong topology data. Both do an EDA dry run first and log in as their own
 limited EDA user, which may only change Interfaces. The GPU VMs handle their side themselves: each runs a host agent
-(`host-agent.sh`, installed by `./deploy.sh`) that takes the tenant's /64 by SLAAC when its port is booked and drops
-it when released. Keep `bash hosts.sh --follow` running in a terminal for the frontend VLAN 2 address.
+(`host-agent.sh`, installed by `./deploy.sh`) that takes its port's /64 by SLAAC when the port is booked, keeps it
+when the GPU moves to the other tenant, and drops it when released. Keep `bash hosts.sh --follow` running in a terminal for the frontend VLAN 2 address.
 
 GPU names: `gpu-<server>-g<index>`, e.g. `gpu-2-g0` = GPU0 of server gpu-2 (its NIC sits on rail 1, leaf l1-1).
 `gpu-2` alone = all four GPUs of that server. Tenants: `tenant-1`, `tenant-2`, or `free`.
@@ -25,7 +25,7 @@ python3 automation/gpu-tenant.py apply automation/tenancy.yaml  # make the fabri
 
 Add `--dry-run` to see EDA's verdict without committing, or `--no-wait` to return right after the commit. Every
 command is one EDA dry run, then one transaction for all its GPUs. It then waits until the switches have the port in
-the tenant's VRF and the GPU's NIC has an address from the tenant's /64. Exit codes: 0 done, 1 EDA refused or someone
+the tenant's VRF and the GPU's NIC has its address there. Exit codes: 0 done, 1 EDA refused or someone
 else changed the same GPU meanwhile, 2 refused before EDA (bad input, or inventory and LLDP disagree).
 
 ## Terraform: `automation/terraform/`

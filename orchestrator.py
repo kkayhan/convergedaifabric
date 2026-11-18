@@ -104,7 +104,7 @@ class Api:
                 if r.get(".namespace.node.name") and r.get("name") and r.get(".namespace.node.srl.network-instance.name")}
 
     def gpu_prefixes(self) -> dict[tuple[str, str], str]:
-        """(leaf, port) -> the /64 the Backend took from the tenant's pool for that GPU port (leaf ::1 stripped)."""
+        """(leaf, port) -> the GPU port's /64 (EDAManagedIPv6: fixed per port) (leaf ::1 stripped)."""
         q = (".namespace.node.srl.interface.subinterface.ipv6.address fields [ip-prefix] "
              "where (.namespace.node.srl.interface.subinterface.index = 1)")
         path = "/core/query/v1/eql?" + urllib.parse.urlencode({"query": q, "namespaces": NS})

@@ -7,7 +7,7 @@
 #   ConnectX-8 on rail G+1 (leaf l1-<G+1>). Tenant = the `tenant` label of that NIC's Interface in EDA;
 #   no label = free (unbooked).
 #   VLAN 1 eth1.1 = the VM's own HOST AGENT (host-agent.sh, owner R2-Q2 2026-11-18), armed here once: SLAAC from the
-#           leaf's router advertisement (the /64 the Backend took from the tenant's pool, host part = EUI-64 of the
+#           leaf's router advertisement (the port's fixed /64, EDAManagedIPv6; host part = EUI-64 of the
 #           NIC's MAC), and it follows bookings, moves and releases BY ITSELF (no script in the booking path). This
 #           script only checks the result against EDA's /64; + IPv4 = the leaf's /31 + 1 when the port carries one of
 #           the example gpu-ipv4 Configlets (owner 2026-11-02), route 10.201.0.0/16 via the leaf.
@@ -90,7 +90,7 @@ wait_ports(){  # wait_ports <server> <n>: cxdp plugs ethN ~60 s after the pod is
 }
 
 # leaf/interface -> /64 of the GPU subinterface (index 1), from EDA's view of the switches (booked ports only;
-# leaf = ::1 of the tenant pool's /64; link-local fe80 rows skipped)
+# leaf = ::1 of the port's /64 = the GPU's gateway; link-local fe80 rows skipped)
 PFX=$($K -n eda-system exec deploy/eda-toolbox -- edactl -n "$NS" query \
   '.namespace.node.srl.interface.subinterface.ipv6.address fields [ip-prefix] where (.namespace.node.srl.interface.subinterface.index = 1)' 2>/dev/null \
   | awk '$5 !~ /^fe80/ && $5 ~ /::1\/64$/ {sub(/::1\/64$/, "", $5); print $2, $3, $5}')
