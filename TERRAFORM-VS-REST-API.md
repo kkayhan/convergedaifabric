@@ -404,8 +404,6 @@ who made the change.
 
 **Cons**
 
-- **Not atomic across ports.** With Nokia's typed resources every port is a separate transaction, so an apply can stop
-  half way. In EDA's history each change only says "REST".
 - **Hard to read.** One label change shows up in the plan surrounded by about 45 lines of "(known after apply)".
 - **Needs careful wiring** to manage objects that Terraform did not create. The ports must be adopted, Terraform must
   be kept away from the rest of each port object, and deletion must be forbidden. Gaps in Nokia's providers on EDA
